@@ -408,11 +408,21 @@ fn grepFiles(allocator: std.mem.Allocator, pattern: []const u8, search_path: ?[]
     defer allocator.free(full_path);
 
     var results = std.ArrayList(u8).empty;
-    errdefer results.deinit(allocator);
+    defer results.deinit(allocator);
     var match_count: usize = 0;
     var files_searched: usize = 0;
 
-    try grepRecursive(allocator, full_path, pattern, include_pattern, &results, &match_count, &files_searched);
+    if (std.Io.Dir.openFileAbsolute(std.Options.debug_io, full_path, .{})) |file| {
+        file.close(std.Options.debug_io);
+        const filename = std.fs.path.basename(full_path);
+        if (!isBinaryFile(filename) and if (include_pattern) |inc| globMatch(filename, inc) else true) {
+            files_searched += 1;
+            try searchInFile(allocator, full_path, pattern, &results, &match_count);
+        }
+    } else |err| switch (err) {
+        error.IsDir => try grepRecursive(allocator, full_path, pattern, include_pattern, &results, &match_count, &files_searched),
+        else => return std.fmt.allocPrint(allocator, "Error opening path: {s}", .{@errorName(err)}),
+    }
 
     if (match_count == 0) {
         return std.fmt.allocPrint(allocator, "No matches for '{s}' in {d} files searched", .{ pattern, files_searched });
