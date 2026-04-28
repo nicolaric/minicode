@@ -479,14 +479,29 @@ fn searchInFile(allocator: std.mem.Allocator, file_path: []const u8, pattern: []
     while (line_iter.next()) |line| : (line_num += 1) {
         if (match_count.* >= max_grep_matches) return;
 
-        // Simple substring search
-        if (std.mem.indexOf(u8, line, pattern)) |_| {
+        // Simple substring search with alternation support (a|b|c)
+        if (lineMatchesPattern(line, pattern)) {
             const read_offset = if (line_num > 20) line_num - 20 else 1;
             const display_line = if (line.len > 200) line[0..200] else line;
             try results.print(allocator, "{s}:{d}: {s}\n  read around: read_file path={s} offset={d} limit=100\n", .{ display_path, line_num, display_line, display_path, read_offset });
             match_count.* += 1;
         }
     }
+}
+
+fn lineMatchesPattern(line: []const u8, pattern: []const u8) bool {
+    // Check for alternation pattern (a|b|c)
+    if (std.mem.indexOfScalar(u8, pattern, '|')) |_| {
+        var alternatives = std.mem.splitScalar(u8, pattern, '|');
+        while (alternatives.next()) |raw_alt| {
+            const alt = std.mem.trim(u8, raw_alt, " \t");
+            if (alt.len == 0) continue;
+            if (std.mem.indexOf(u8, line, alt)) |_| return true;
+        }
+        return false;
+    }
+    // Simple substring search
+    return std.mem.indexOf(u8, line, pattern) != null;
 }
 
 fn relativeDisplayPath(allocator: std.mem.Allocator, file_path: []const u8) ![]u8 {
