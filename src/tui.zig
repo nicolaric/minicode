@@ -552,6 +552,9 @@ const App = struct {
             defer self.allocator.free(safe_arg);
             // Truncate long arguments
             const display_arg = if (safe_arg.len > 50) safe_arg[0..50] else safe_arg;
+            if (std.mem.eql(u8, tool_name, "run_shell")) {
+                return std.fmt.allocPrint(self.allocator, "{s} {s} {s} ... [confirm y/N]", .{ toolMarker(tool_name), toolVerb(tool_name), display_arg });
+            }
             return std.fmt.allocPrint(self.allocator, "{s} {s} {s} ...", .{ toolMarker(tool_name), toolVerb(tool_name), display_arg });
         } else {
             return std.fmt.allocPrint(self.allocator, "{s} {s} ...", .{ toolMarker(tool_name), toolVerb(tool_name) });
