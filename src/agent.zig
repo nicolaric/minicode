@@ -9,7 +9,7 @@ pub const system_prompt =
     \\DO NOT output thinking or explanations when using tools.
     \\CORRECT: {"tool":"read_file","args":{"path":"src/main.zig"}}
     \\WRONG: Let me check the file... {"tool":"read_file"...}
-    \\When searching for code, read the ENTIRE file at once (no offset) for files under 500 lines, or use large offsets (100+) to advance through big files.
+    \\NAVIGATION RULES: 1) For files under 500 lines, read with no offset to get the whole file at once. 2) For large files, use grep FIRST to find line numbers, then read around that line. 3) If you must scan without grep, read offset=1 first, then offset=101, 201, etc. 4) NEVER use offset=10, 11, 12 repeatedly.
     \\Tools:
     \\  read_file(path, offset?, limit?) - read 100 numbered file lines; offset defaults to line 1
     \\  write_file(path, content) - write file (shows numbered diff if overwriting)
