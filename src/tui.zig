@@ -552,6 +552,12 @@ const App = struct {
             defer self.allocator.free(safe_arg);
             // Truncate long arguments
             const display_arg = if (safe_arg.len > 50) safe_arg[0..50] else safe_arg;
+            if (std.mem.eql(u8, tool_name, "edit")) {
+                return std.fmt.allocPrint(self.allocator, "→ Prepare editing {s} ...", .{display_arg});
+            }
+            if (std.mem.eql(u8, tool_name, "write_file")) {
+                return std.fmt.allocPrint(self.allocator, "→ Prepare writing {s} ... [confirm y/N if overwriting]", .{display_arg});
+            }
             if (std.mem.eql(u8, tool_name, "run_shell")) {
                 return std.fmt.allocPrint(self.allocator, "{s} {s} {s} ... [confirm y/N]", .{ toolMarker(tool_name), toolVerb(tool_name), display_arg });
             }
@@ -592,6 +598,12 @@ const App = struct {
             return std.fmt.allocPrint(self.allocator, "→ Read {s} [offset={d}, limit={d}]", .{ path, off, lim });
         } else if (std.mem.eql(u8, tool_name, "write_file")) {
             const path = main_arg orelse "unknown";
+            if (std.mem.startsWith(u8, result, "Error:")) {
+                return std.fmt.allocPrint(self.allocator, "→ Write {s} [failed]", .{path});
+            }
+            if (std.mem.indexOf(u8, result, "cancelled") != null) {
+                return std.fmt.allocPrint(self.allocator, "→ Write {s} [cancelled]", .{path});
+            }
             const is_new = std.mem.indexOf(u8, result, "new file") != null;
             if (is_new) {
                 return std.fmt.allocPrint(self.allocator, "→ Write {s} [new]", .{path});
@@ -637,6 +649,9 @@ const App = struct {
             }
         } else if (std.mem.eql(u8, tool_name, "edit")) {
             const path = main_arg orelse "unknown";
+            if (std.mem.startsWith(u8, result, "Error:")) {
+                return std.fmt.allocPrint(self.allocator, "→ Edit {s} [failed]", .{path});
+            }
             return std.fmt.allocPrint(self.allocator, "→ Edit {s}", .{path});
         } else {
             return std.fmt.allocPrint(self.allocator, "→ {s} [done]", .{tool_name});
