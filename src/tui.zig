@@ -466,6 +466,7 @@ const App = struct {
                     break :blk try std.fmt.allocPrint(self.allocator, "Tool error: {s}", .{@errorName(err)});
                 };
                 defer self.allocator.free(result);
+                tools.logToolCall(self.allocator, parsed.value, result);
                 if (std.mem.startsWith(u8, result, "Error:") or std.mem.startsWith(u8, result, "Tool error:")) {
                     tool_failed = true;
                 }
@@ -494,6 +495,7 @@ const App = struct {
 
             if (containsToolAttempt(final_content)) {
                 const error_message = "Error: Invalid tool JSON. Expected {\"tool\":\"TOOL_NAME\",\"args\":{...}}";
+                tools.logInvalidToolJson(self.allocator, final_content, error_message);
                 try self.addLine("", .{});
                 try self.addToolError(error_message);
                 try self.addLine("", .{});
@@ -685,7 +687,7 @@ const App = struct {
                 self.allocator.free(key);
                 return try std.fmt.allocPrint(
                     self.allocator,
-                    "Error: Already read {s} at offset={d} in this turn. Use grep, use a different offset, or continue with offset={d}.",
+                    "Error: Already read {s} at offset={d} in this turn. If grep showed a line like 1680, use offset=1680 EXACTLY; do not shorten it to 168/160/180. Otherwise continue after this range with offset={d}.",
                     .{ path, offset, offset + 100 },
                 );
             }

@@ -9,10 +9,10 @@ pub const system_prompt =
     \\DO NOT output thinking or explanations when using tools.
     \\CORRECT: {"tool":"read_file","args":{"path":"src/main.zig"}}
     \\WRONG: Let me check the file... {"tool":"read_file"...}
-    \\NAVIGATION RULES: 1) For files under 500 lines, read with no offset to get the whole file at once. 2) For large files, use grep FIRST to find line numbers, then read around that line. 3) If you must scan without grep, read offset=1 first, then offset=101, 201, etc. 4) NEVER use offset=10, 11, 12 repeatedly.
+    \\NAVIGATION RULES: 1) For files under 500 lines, read with no offset to get the whole file at once. 2) For large files, use grep FIRST to find line numbers, then use the EXACT READ COMMAND shown by grep. 3) If grep says line 1680 or offset=1680, call read_file with offset=1680 exactly; NEVER use 168, 160, 180, or any rounded/truncated number. 4) If you must scan without grep, read offset=1 first, then continue with the exact offset suggested by read_file. 5) NEVER use offset=10, 11, 12 repeatedly.
     \\Do not use run_shell for file navigation, line counts, grep, cat, find, or ls. Use read_file, grep, glob, and list_files instead.
     \\Tools:
-    \\  read_file(path, offset?, limit?) - read 100 numbered file lines; offset defaults to line 1
+    \\  read_file(path, offset?, limit?) - read 300 numbered file lines; offset defaults to line 1
     \\  write_file(path, content) - write file (shows numbered diff if overwriting)
     \\  list_files(path) - list directory contents
     \\  run_shell(command) - run non-file shell commands only; requires confirmation
@@ -21,7 +21,7 @@ pub const system_prompt =
     \\  edit(path, oldString, newString) - replace text in file and show numbered diff (requires unique match)
     \\All file paths must be relative to the current working directory.
     \\For large files, use offset and limit to read specific line ranges.
-    \\When grep reports a match at line N, inspect it with read_file offset=N or offset=max(1, N-20). Never shorten line numbers such as 774 to 70.
+    \\When grep reports a match at line N, inspect it with read_file offset=N exactly. Never shorten, round, or drop digits from line numbers: 1680 means offset=1680, NOT 168, 160, or 180.
     ;
 
 pub fn run(allocator: std.mem.Allocator, cfg: config.Config) !void {
@@ -69,6 +69,7 @@ fn completeTurn(allocator: std.mem.Allocator, cfg: config.Config, messages: *std
             defer parsed.deinit();
             const result = tools.execute(allocator, parsed.value) catch |err| try std.fmt.allocPrint(allocator, "Tool error: {s}", .{@errorName(err)});
             defer allocator.free(result);
+            tools.logToolCall(allocator, parsed.value, result);
 
             try stdout.print("\n[tool:{s}]\n{s}\n\n", .{ parsed.value.tool, result });
             const tool_message = try std.fmt.allocPrint(allocator, "Result from tool `{s}`. Use this result to continue; do not repeat the same tool call unless you need a different offset, limit, path, or pattern.\n{s}", .{ parsed.value.tool, result });

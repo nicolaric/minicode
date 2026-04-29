@@ -6,7 +6,6 @@ pub const default_model = "qwen3.6:27b-coding-nvfp4";
 pub const Config = struct {
     base_url: []const u8,
     model: []const u8,
-    syntax_highlighting: bool,
 };
 
 fn getEnvVar(name: []const u8) ?[]const u8 {
@@ -24,11 +23,8 @@ fn getEnvVar(name: []const u8) ?[]const u8 {
 }
 
 pub fn load() Config {
-    const syntax_env = getEnvVar("NIC_SYNTAX_HIGHLIGHTING") orelse "true";
-    const syntax_highlighting = std.ascii.eqlIgnoreCase(syntax_env, "true") or std.ascii.eqlIgnoreCase(syntax_env, "1") or std.ascii.eqlIgnoreCase(syntax_env, "yes");
     return .{
         .base_url = getEnvVar("OLLAMA_BASE_URL") orelse default_base_url,
         .model = getEnvVar("OLLAMA_MODEL") orelse default_model,
-        .syntax_highlighting = syntax_highlighting,
     };
 }

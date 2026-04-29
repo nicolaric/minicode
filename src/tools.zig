@@ -1,4 +1,5 @@
 const std = @import("std");
+const builtin = @import("builtin");
 
 const testing = std.testing;
 
@@ -6,6 +7,9 @@ pub const ToolRequest = struct {
     tool: []const u8,
     args: std.json.Value,
 };
+
+const tool_log_file_name = "tool-calls.log";
+const max_logged_tool_output: usize = 64 * 1024;
 
 pub const ConfirmFn = *const fn (ctx: *anyopaque, prompt: []const u8) anyerror!bool;
 
@@ -98,6 +102,86 @@ pub fn execute(allocator: std.mem.Allocator, req: ToolRequest) ![]u8 {
     return executeWithConfirm(allocator, req, null);
 }
 
+pub fn logToolCall(allocator: std.mem.Allocator, req: ToolRequest, result: []const u8) void {
+    const args_json = stringifyJsonValue(allocator, req.args) catch return;
+    defer allocator.free(args_json);
+    logToolEvent(allocator, "tool_call", req.tool, args_json, result);
+}
+
+pub fn logInvalidToolJson(allocator: std.mem.Allocator, raw_text: []const u8, error_message: []const u8) void {
+    const snippet_len = @min(raw_text.len, max_logged_tool_output);
+    logToolEvent(allocator, "invalid_tool_json", "parse", raw_text[0..snippet_len], error_message);
+}
+
+fn stringifyJsonValue(allocator: std.mem.Allocator, value: std.json.Value) ![]u8 {
+    var json_writer = std.Io.Writer.Allocating.init(allocator);
+    defer json_writer.deinit();
+    try std.json.Stringify.value(value, .{ .whitespace = .minified }, &json_writer.writer);
+    return allocator.dupe(u8, json_writer.written());
+}
+
+fn logToolEvent(allocator: std.mem.Allocator, event: []const u8, tool_name: []const u8, args_text: []const u8, result: []const u8) void {
+    const log_dir = toolLogDir(allocator) catch return;
+    defer allocator.free(log_dir);
+    std.Io.Dir.cwd().createDirPath(std.Options.debug_io, log_dir) catch return;
+
+    const log_path = std.fs.path.join(allocator, &.{ log_dir, tool_log_file_name }) catch return;
+    defer allocator.free(log_path);
+
+    var file = std.Io.Dir.openFileAbsolute(std.Options.debug_io, log_path, .{ .mode = .read_write }) catch |open_err| switch (open_err) {
+        error.FileNotFound => std.Io.Dir.createFileAbsolute(std.Options.debug_io, log_path, .{ .read = true, .truncate = false }) catch return,
+        else => return,
+    };
+    defer file.close(std.Options.debug_io);
+
+    var entry = std.ArrayList(u8).empty;
+    defer entry.deinit(allocator);
+    const now_ms = currentTimeMs();
+    entry.print(allocator, "--- {s} time_ms={d} tool={s}\nargs=", .{ event, now_ms, tool_name }) catch return;
+    entry.appendSlice(allocator, args_text) catch return;
+    const status = if (std.mem.startsWith(u8, result, "Error:") or std.mem.startsWith(u8, result, "Tool error:") or std.mem.indexOf(u8, result, "\x1b[31mError:") != null) "error" else "ok";
+    const output_len = @min(result.len, max_logged_tool_output);
+    entry.print(allocator, "\nstatus={s} result_len={d}\noutput_truncated={any}\noutput<<MINICODE_TOOL_OUTPUT\n{s}\nMINICODE_TOOL_OUTPUT\n\n", .{
+        status,
+        result.len,
+        result.len > max_logged_tool_output,
+        result[0..output_len],
+    }) catch return;
+
+    const stat = file.stat(std.Options.debug_io) catch return;
+    file.writePositionalAll(std.Options.debug_io, entry.items, stat.size) catch return;
+}
+
+fn toolLogDir(allocator: std.mem.Allocator) ![]u8 {
+    if (builtin.os.tag == .macos) {
+        const home = try getEnvOwned(allocator, "HOME");
+        defer allocator.free(home);
+        return std.fs.path.join(allocator, &.{ home, "Library", "Logs", "minicode" });
+    }
+
+    if (getEnvOwned(allocator, "XDG_STATE_HOME")) |state_home| {
+        defer allocator.free(state_home);
+        return std.fs.path.join(allocator, &.{ state_home, "minicode", "logs" });
+    } else |_| {}
+
+    const home = try getEnvOwned(allocator, "HOME");
+    defer allocator.free(home);
+    return std.fs.path.join(allocator, &.{ home, ".local", "state", "minicode", "logs" });
+}
+
+fn getEnvOwned(allocator: std.mem.Allocator, comptime name: [:0]const u8) ![]u8 {
+    const value = std.c.getenv(name.ptr) orelse return error.MissingEnvironmentVariable;
+    return allocator.dupe(u8, std.mem.span(value));
+}
+
+fn currentTimeMs() i128 {
+    var ts: std.c.timespec = undefined;
+    if (std.c.clock_gettime(.REALTIME, &ts) == 0) {
+        return @as(i128, ts.sec) * 1000 + @divTrunc(@as(i128, ts.nsec), 1_000_000);
+    }
+    return 0;
+}
+
 test "write_file creates a file" {
     const path = ".tmp-write-tool-test.txt";
     std.Io.Dir.cwd().deleteFile(std.Options.debug_io, path) catch |err| switch (err) {
@@ -158,9 +242,9 @@ test "grep supports regex operators" {
     try args.put(allocator, "pattern", .{ .string = "^a.+c$" });
 
     const result = try execute(allocator, .{ .tool = "grep", .args = .{ .object = args } });
-    try testing.expect(std.mem.indexOf(u8, result, ":1:") != null);
-    try testing.expect(std.mem.indexOf(u8, result, ":2:") != null);
-    try testing.expect(std.mem.indexOf(u8, result, ":3:") != null);
+    try testing.expect(std.mem.indexOf(u8, result, "Line: 1") != null);
+    try testing.expect(std.mem.indexOf(u8, result, "Line: 2") != null);
+    try testing.expect(std.mem.indexOf(u8, result, "Line: 3") != null);
 }
 
 test "grep supports case_insensitive arg" {
@@ -225,7 +309,104 @@ test "grep finds thinking title in tui by default" {
     const result = try execute(allocator, .{ .tool = "grep", .args = .{ .object = args } });
     try testing.expect(std.mem.indexOf(u8, result, "src/tui.zig") != null);
     try testing.expect(std.mem.indexOf(u8, result, "Thinking") != null);
-    try testing.expect(std.mem.indexOf(u8, result, "No matches") == null);
+}
+
+test "grep include matches relative paths" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const allocator = arena.allocator();
+
+    var args = try std.json.ObjectMap.init(allocator, &.{}, &.{});
+    try args.put(allocator, "pattern", .{ .string = "thinking_marker" });
+    try args.put(allocator, "include", .{ .string = "src/*.zig" });
+
+    const result = try execute(allocator, .{ .tool = "grep", .args = .{ .object = args } });
+    try testing.expect(std.mem.indexOf(u8, result, "src/tui.zig") != null);
+}
+
+test "glob supports recursive directory pattern" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const allocator = arena.allocator();
+
+    var args = try std.json.ObjectMap.init(allocator, &.{}, &.{});
+    try args.put(allocator, "pattern", .{ .string = "src/**/*" });
+
+    const result = try execute(allocator, .{ .tool = "glob", .args = .{ .object = args } });
+    try testing.expect(std.mem.indexOf(u8, result, "src/tui.zig") != null);
+}
+
+test "edit exact replacement still works" {
+    const path = ".tmp-edit-exact-test.txt";
+    std.Io.Dir.cwd().deleteFile(std.Options.debug_io, path) catch |err| switch (err) {
+        error.FileNotFound => {},
+        else => return err,
+    };
+    defer std.Io.Dir.cwd().deleteFile(std.Options.debug_io, path) catch {};
+
+    {
+        var file = try std.Io.Dir.cwd().createFile(std.Options.debug_io, path, .{});
+        defer file.close(std.Options.debug_io);
+        try std.Io.File.writeStreamingAll(file, std.Options.debug_io, "alpha\nbeta\n");
+    }
+
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const allocator = arena.allocator();
+
+    const result = try editFile(allocator, path, "beta", "gamma");
+    try testing.expect(std.mem.indexOf(u8, result, "Edited") != null);
+
+    const content = try std.Io.Dir.cwd().readFileAlloc(std.Options.debug_io, path, allocator, .limited(1024));
+    try testing.expectEqualStrings("alpha\ngamma\n", content);
+}
+
+test "edit whitespace-tolerant single-line replacement preserves indentation" {
+    const path = ".tmp-edit-whitespace-test.html";
+    std.Io.Dir.cwd().deleteFile(std.Options.debug_io, path) catch |err| switch (err) {
+        error.FileNotFound => {},
+        else => return err,
+    };
+    defer std.Io.Dir.cwd().deleteFile(std.Options.debug_io, path) catch {};
+
+    {
+        var file = try std.Io.Dir.cwd().createFile(std.Options.debug_io, path, .{});
+        defer file.close(std.Options.debug_io);
+        try std.Io.File.writeStreamingAll(file, std.Options.debug_io, "<html>\n    <title>Old</title>   \n</html>\n");
+    }
+
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const allocator = arena.allocator();
+
+    const result = try editFile(allocator, path, "\t<title>Old</title>", "  <title>New</title>");
+    try testing.expect(std.mem.indexOf(u8, result, "Edited") != null);
+
+    const content = try std.Io.Dir.cwd().readFileAlloc(std.Options.debug_io, path, allocator, .limited(1024));
+    try testing.expectEqualStrings("<html>\n    <title>New</title>   \n</html>\n", content);
+}
+
+test "edit ambiguous whitespace-tolerant matches return an error" {
+    const path = ".tmp-edit-ambiguous-test.html";
+    std.Io.Dir.cwd().deleteFile(std.Options.debug_io, path) catch |err| switch (err) {
+        error.FileNotFound => {},
+        else => return err,
+    };
+    defer std.Io.Dir.cwd().deleteFile(std.Options.debug_io, path) catch {};
+
+    {
+        var file = try std.Io.Dir.cwd().createFile(std.Options.debug_io, path, .{});
+        defer file.close(std.Options.debug_io);
+        try std.Io.File.writeStreamingAll(file, std.Options.debug_io, "  <title>Same</title>\n    <title>Same</title>\n");
+    }
+
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const allocator = arena.allocator();
+
+    const result = try editFile(allocator, path, "\t<title>Same</title>", "<title>New</title>");
+    try testing.expect(std.mem.indexOf(u8, result, "ambiguous") != null);
+    try testing.expect(std.mem.indexOf(u8, result, "lines: 1, 2") != null);
 }
 
 pub fn executeWithConfirm(allocator: std.mem.Allocator, req: ToolRequest, confirmer: ?Confirm) ![]u8 {
@@ -245,6 +426,7 @@ pub fn executeWithConfirm(allocator: std.mem.Allocator, req: ToolRequest, confir
         getStringArg(req.args, "path"),
         getStringArg(req.args, "include"),
         getBoolArg(req.args, "case_sensitive") orelse false,
+        getUsizeArg(req.args, "context"),
     );
     if (std.mem.eql(u8, req.tool, "edit")) return editFile(allocator, getStringArg(req.args, "path") orelse return error.InvalidToolArgs, getStringArg(req.args, "oldString") orelse return error.InvalidToolArgs, getStringArg(req.args, "newString") orelse return error.InvalidToolArgs);
     return std.fmt.allocPrint(allocator, "Error: Unknown tool: {s}", .{req.tool});
@@ -262,6 +444,7 @@ fn getUsizeArg(args: std.json.Value, name: []const u8) ?usize {
     const value = args.object.get(name) orelse return null;
     return switch (value) {
         .integer => |i| if (i >= 0) @intCast(i) else null,
+        .string => |s| std.fmt.parseUnsigned(usize, s, 10) catch null,
         else => null,
     };
 }
@@ -311,7 +494,7 @@ fn hasParentTraversal(path: []const u8) bool {
     return false;
 }
 
-const max_read_lines: usize = 100;
+const max_read_lines: usize = 300;
 const max_grep_matches: usize = 20;
 
 /// Read file contents with optional offset and limit
@@ -327,8 +510,7 @@ fn readFile(allocator: std.mem.Allocator, path: []const u8, offset: ?usize, limi
     const content = std.Io.Dir.cwd().readFileAlloc(std.Options.debug_io, full_path, allocator, .limited(1024 * 1024)) catch |err| {
         return std.fmt.allocPrint(allocator, "Error reading file: {s}", .{@errorName(err)});
     };
-    _ = limit;
-    const line_limit = max_read_lines;
+    const line_limit = @min(limit orelse max_read_lines, max_read_lines);
 
     var result = std.ArrayList(u8).empty;
     errdefer result.deinit(allocator);
@@ -354,7 +536,7 @@ fn readFile(allocator: std.mem.Allocator, path: []const u8, offset: ?usize, limi
     defer allocator.free(body);
     allocator.free(content);
 
-    return std.fmt.allocPrint(allocator, "File: {s}\nRead line range: {d}-{d}\nTo continue after this range, call read_file with offset={d}.\nTo inspect a grep match at line N, call read_file with offset=N or offset=max(1, N-20). Do not drop digits from line numbers.\n{s}", .{ path, offset orelse 1, end_line, end_line + 1, body });
+    return std.fmt.allocPrint(allocator, "File: {s}\nRead line range: {d}-{d}\nTo continue after this range, call read_file with offset={d}.\nTo inspect a grep match at line N, call read_file with offset=N exactly. Do not shorten, round, or drop digits from line numbers.\n{s}", .{ path, offset orelse 1, end_line, end_line + 1, body });
 }
 
 /// Write file with confirmation for existing files
@@ -511,6 +693,21 @@ fn globFiles(allocator: std.mem.Allocator, pattern: []const u8, search_path: ?[]
     var result = std.ArrayList(u8).empty;
     errdefer result.deinit(allocator);
 
+    // Common recursive directory form: src/**/* means all files below src/.
+    if (std.mem.endsWith(u8, pattern, "/**/*")) {
+        const recursive_base = pattern[0 .. pattern.len - "/**/*".len];
+        if (hasParentTraversal(recursive_base)) return std.fmt.allocPrint(allocator, "Error: Pattern cannot contain ..", .{});
+        const full_recursive_base = resolveInsideCwd(allocator, recursive_base) catch |err| {
+            return switch (err) {
+                error.PathOutsideCwd => std.fmt.allocPrint(allocator, "Error: Path must be relative and within current directory", .{}),
+                else => std.fmt.allocPrint(allocator, "Error resolving path: {s}", .{@errorName(err)}),
+            };
+        };
+        defer allocator.free(full_recursive_base);
+        try globRecursive(allocator, full_recursive_base, "*", &result);
+        return result.toOwnedSlice(allocator);
+    }
+
     // Check if pattern starts with ** (recursive search from base)
     const is_recursive = std.mem.startsWith(u8, pattern, "**/");
     const file_pattern = if (is_recursive) pattern[3..] else pattern;
@@ -607,6 +804,14 @@ fn globMatch(filename: []const u8, pattern: []const u8) bool {
     return f == filename.len;
 }
 
+fn includeGlobMatches(filename: []const u8, rel_path: []const u8, pattern: []const u8) bool {
+    if (globMatch(filename, pattern) or globMatch(rel_path, pattern)) return true;
+    if (std.mem.startsWith(u8, rel_path, "./")) {
+        return globMatch(rel_path[2..], pattern);
+    }
+    return false;
+}
+
 const RegexError = error{
     EmptyPattern,
     PatternTooLong,
@@ -641,7 +846,7 @@ fn hasRegexMetacharacters(pattern: []const u8) bool {
 }
 
 /// Search file contents for a substring pattern
-fn grepFiles(allocator: std.mem.Allocator, pattern: []const u8, search_path: ?[]const u8, include_pattern: ?[]const u8, case_sensitive: bool) ![]u8 {
+fn grepFiles(allocator: std.mem.Allocator, pattern: []const u8, search_path: ?[]const u8, include_pattern: ?[]const u8, case_sensitive: bool, context: ?usize) ![]u8 {
     if (pattern.len == 0) return regexErrorAnsi(allocator, error.EmptyPattern);
     if (pattern.len > 100) return regexErrorAnsi(allocator, error.PatternTooLong);
 
@@ -671,13 +876,18 @@ fn grepFiles(allocator: std.mem.Allocator, pattern: []const u8, search_path: ?[]
     if (std.Io.Dir.openDirAbsolute(std.Options.debug_io, full_path, .{ .iterate = true })) |dir| {
         var mutable_dir = dir;
         mutable_dir.close(std.Options.debug_io);
-        try grepRecursive(allocator, full_path, pattern, include_pattern, case_sensitive, &results, &match_count, &files_searched);
+        try grepRecursive(allocator, full_path, pattern, include_pattern, case_sensitive, context, &results, &match_count, &files_searched);
     } else |_| if (std.Io.Dir.openFileAbsolute(std.Options.debug_io, full_path, .{})) |file| {
         file.close(std.Options.debug_io);
         const filename = std.fs.path.basename(full_path);
-        if (!isBinaryFile(filename) and if (include_pattern) |inc| globMatch(filename, inc) else true) {
+        const include_matches = if (include_pattern) |inc| blk: {
+            const rel_path = try relativeDisplayPath(allocator, full_path);
+            defer allocator.free(rel_path);
+            break :blk includeGlobMatches(filename, rel_path, inc);
+        } else true;
+        if (!isBinaryFile(filename) and include_matches) {
             files_searched += 1;
-            try searchInFile(allocator, full_path, pattern, case_sensitive, &results, &match_count);
+            try searchInFile(allocator, full_path, pattern, case_sensitive, context, &results, &match_count);
         }
     } else |err| switch (err) {
         else => return std.fmt.allocPrint(allocator, "Error opening path: {s}", .{@errorName(err)}),
@@ -690,7 +900,7 @@ fn grepFiles(allocator: std.mem.Allocator, pattern: []const u8, search_path: ?[]
     return std.fmt.allocPrint(allocator, "Found {d} matches in {d} files{s}:\n{s}", .{ match_count, files_searched, capped, results.items });
 }
 
-fn grepRecursive(allocator: std.mem.Allocator, dir_path: []const u8, pattern: []const u8, include_pattern: ?[]const u8, case_sensitive: bool, results: *std.ArrayList(u8), match_count: *usize, files_searched: *usize) !void {
+fn grepRecursive(allocator: std.mem.Allocator, dir_path: []const u8, pattern: []const u8, include_pattern: ?[]const u8, case_sensitive: bool, context: ?usize, results: *std.ArrayList(u8), match_count: *usize, files_searched: *usize) !void {
     if (match_count.* >= max_grep_matches) return;
 
     var dir = std.Io.Dir.openDirAbsolute(std.Options.debug_io, dir_path, .{ .iterate = true }) catch return;
@@ -709,11 +919,16 @@ fn grepRecursive(allocator: std.mem.Allocator, dir_path: []const u8, pattern: []
                 std.mem.eql(u8, entry.name, "zig-out") or
                 std.mem.eql(u8, entry.name, "node_modules") or
                 std.mem.eql(u8, entry.name, ".git")) continue;
-            try grepRecursive(allocator, entry_path, pattern, include_pattern, case_sensitive, results, match_count, files_searched);
+            try grepRecursive(allocator, entry_path, pattern, include_pattern, case_sensitive, context, results, match_count, files_searched);
         } else if (entry.kind == .file) {
-            if (!isBinaryFile(entry.name) and if (include_pattern) |inc| globMatch(entry.name, inc) else true) {
+            const include_matches = if (include_pattern) |inc| blk: {
+                const rel_path = try relativeDisplayPath(allocator, entry_path);
+                defer allocator.free(rel_path);
+                break :blk includeGlobMatches(entry.name, rel_path, inc);
+            } else true;
+            if (!isBinaryFile(entry.name) and include_matches) {
                 files_searched.* += 1;
-                try searchInFile(allocator, entry_path, pattern, case_sensitive, results, match_count);
+                try searchInFile(allocator, entry_path, pattern, case_sensitive, context, results, match_count);
             }
         }
     }
@@ -734,7 +949,7 @@ fn isBinaryFile(filename: []const u8) bool {
     return false;
 }
 
-fn searchInFile(allocator: std.mem.Allocator, file_path: []const u8, pattern: []const u8, case_sensitive: bool, results: *std.ArrayList(u8), match_count: *usize) !void {
+fn searchInFile(allocator: std.mem.Allocator, file_path: []const u8, pattern: []const u8, case_sensitive: bool, context: ?usize, results: *std.ArrayList(u8), match_count: *usize) !void {
     if (match_count.* >= max_grep_matches) return;
 
     const content = std.Io.Dir.cwd().readFileAlloc(std.Options.debug_io, file_path, allocator, .limited(1024 * 1024)) catch return;
@@ -743,18 +958,50 @@ fn searchInFile(allocator: std.mem.Allocator, file_path: []const u8, pattern: []
     const display_path = try relativeDisplayPath(allocator, file_path);
     defer allocator.free(display_path);
 
+    var lines = std.ArrayList([]const u8).empty;
+    defer lines.deinit(allocator);
     var line_iter = std.mem.splitScalar(u8, content, '\n');
-    var line_num: usize = 1;
-    while (line_iter.next()) |line| : (line_num += 1) {
-        if (match_count.* >= max_grep_matches) return;
+    while (line_iter.next()) |line| try lines.append(allocator, line);
 
-        // Simple substring search with alternation support (a|b|c)
-        if (lineMatchesPattern(line, pattern, case_sensitive)) {
-            const read_offset = if (line_num > 20) line_num - 20 else 1;
-            const display_line = if (line.len > 200) line[0..200] else line;
-            try results.print(allocator, "{s}:{d}: {s}\n  read around: read_file path={s} offset={d} limit=100\n", .{ display_path, line_num, display_line, display_path, read_offset });
-            match_count.* += 1;
+    var matches = std.ArrayList(usize).empty;
+    defer matches.deinit(allocator);
+    for (lines.items, 0..) |line, idx| {
+        if (matches.items.len >= max_grep_matches) break;
+        if (lineMatchesPattern(line, pattern, case_sensitive)) try matches.append(allocator, idx + 1);
+    }
+
+    const context_lines = @min(context orelse if (matches.items.len <= 3) @as(usize, 20) else @as(usize, 0), @as(usize, 50));
+    for (matches.items) |line_num| {
+        if (match_count.* >= max_grep_matches) return;
+        const line = lines.items[line_num - 1];
+        const display_line = if (line.len > 200) line[0..200] else line;
+        try results.print(allocator,
+            \\Match {d}
+            \\File: {s}
+            \\Line: {d}
+            \\Text: {s}
+        , .{ match_count.* + 1, display_path, line_num, display_line });
+
+        if (context_lines > 0) {
+            const start = if (line_num > context_lines) line_num - context_lines else 1;
+            const end = @min(lines.items.len, line_num + context_lines);
+            try results.print(allocator, "Context lines {d}-{d}:\n", .{ start, end });
+            var current = start;
+            while (current <= end) : (current += 1) {
+                const prefix: u8 = if (current == line_num) '>' else ' ';
+                const context_line = lines.items[current - 1];
+                const display_context_line = if (context_line.len > 200) context_line[0..200] else context_line;
+                try results.print(allocator, "{c} {d}: {s}\n", .{ prefix, current, display_context_line });
+            }
+        } else {
+            try results.print(allocator,
+                \\Next tool call:
+                \\{{"tool":"read_file","args":{{"path":"{s}","offset":{d},"limit":300}}}}
+                \\
+            , .{ display_path, line_num });
         }
+        try results.append(allocator, '\n');
+        match_count.* += 1;
     }
 }
 
@@ -988,10 +1235,13 @@ fn editFile(allocator: std.mem.Allocator, path: []const u8, old_string: []const 
     defer allocator.free(content);
 
     const match_count = std.mem.count(u8, content, old_string);
-    if (match_count == 0) return std.fmt.allocPrint(allocator, "Error: oldString not found in {s}", .{path});
     if (match_count > 1) return std.fmt.allocPrint(allocator, "Error: oldString matches {d} locations, must be unique", .{match_count});
+    if (match_count == 0 and !isSingleLine(old_string)) return oldStringNotFoundError(allocator, path, content, old_string);
 
-    const new_content = try std.mem.replaceOwned(u8, allocator, content, old_string, new_string);
+    const new_content = if (match_count == 1)
+        try std.mem.replaceOwned(u8, allocator, content, old_string, new_string)
+    else
+        try whitespaceTolerantSingleLineEdit(allocator, path, content, old_string, new_string);
     defer allocator.free(new_content);
 
     var file = std.Io.Dir.createFileAbsolute(std.Options.debug_io, full_path, .{}) catch |err| {
@@ -1006,6 +1256,145 @@ fn editFile(allocator: std.mem.Allocator, path: []const u8, old_string: []const 
     const diff_text = try diffAlloc(allocator, content, new_content);
     defer allocator.free(diff_text);
     return std.fmt.allocPrint(allocator, "Edited {s}\n{s}", .{ path, diff_text });
+}
+
+fn isSingleLine(text: []const u8) bool {
+    return std.mem.indexOfAny(u8, text, "\r\n") == null;
+}
+
+fn whitespaceTolerantSingleLineEdit(allocator: std.mem.Allocator, path: []const u8, content: []const u8, old_string: []const u8, new_string: []const u8) ![]u8 {
+    const trimmed_old = std.mem.trim(u8, old_string, " \t\r\n");
+    const trimmed_new = std.mem.trim(u8, new_string, " \t\r\n");
+
+    var matches = std.ArrayList(LineMatch).empty;
+    defer matches.deinit(allocator);
+
+    var it = lineIterator(content);
+    while (it.next()) |line| {
+        if (std.mem.eql(u8, std.mem.trim(u8, line.text, " \t\r\n"), trimmed_old)) {
+            try matches.append(allocator, line);
+        }
+    }
+
+    if (matches.items.len == 0) return oldStringNotFoundError(allocator, path, content, old_string);
+    if (matches.items.len > 1) return ambiguousWhitespaceEditError(allocator, matches.items);
+
+    const match = matches.items[0];
+    const trimmed_line = std.mem.trim(u8, match.text, " \t\r\n");
+    const trim_start = @intFromPtr(trimmed_line.ptr) - @intFromPtr(match.text.ptr);
+    const trim_end = trim_start + trimmed_line.len;
+
+    var result = std.ArrayList(u8).empty;
+    errdefer result.deinit(allocator);
+    try result.appendSlice(allocator, content[0..match.start]);
+    try result.appendSlice(allocator, match.text[0..trim_start]);
+    try result.appendSlice(allocator, trimmed_new);
+    try result.appendSlice(allocator, match.text[trim_end..]);
+    try result.appendSlice(allocator, match.newline);
+    try result.appendSlice(allocator, content[match.end..]);
+    return result.toOwnedSlice(allocator);
+}
+
+const LineMatch = struct {
+    number: usize,
+    start: usize,
+    end: usize,
+    text: []const u8,
+    newline: []const u8,
+};
+
+const LineIterator = struct {
+    content: []const u8,
+    index: usize = 0,
+    number: usize = 1,
+
+    fn next(self: *LineIterator) ?LineMatch {
+        if (self.index >= self.content.len) return null;
+
+        const start = self.index;
+        var line_end = start;
+        while (line_end < self.content.len and self.content[line_end] != '\n') line_end += 1;
+
+        var text_end = line_end;
+        if (text_end > start and self.content[text_end - 1] == '\r') text_end -= 1;
+
+        const newline_end = if (line_end < self.content.len) line_end + 1 else line_end;
+        const line = LineMatch{
+            .number = self.number,
+            .start = start,
+            .end = newline_end,
+            .text = self.content[start..text_end],
+            .newline = self.content[text_end..newline_end],
+        };
+
+        self.index = newline_end;
+        self.number += 1;
+        return line;
+    }
+};
+
+fn lineIterator(content: []const u8) LineIterator {
+    return .{ .content = content };
+}
+
+fn ambiguousWhitespaceEditError(allocator: std.mem.Allocator, matches: []const LineMatch) ![]u8 {
+    var result = std.ArrayList(u8).empty;
+    errdefer result.deinit(allocator);
+    try result.appendSlice(allocator, "Error: oldString whitespace-normalized match is ambiguous at lines: ");
+    for (matches, 0..) |match, i| {
+        if (i > 0) try result.appendSlice(allocator, ", ");
+        try result.print(allocator, "{d}", .{match.number});
+    }
+    return result.toOwnedSlice(allocator);
+}
+
+fn oldStringNotFoundError(allocator: std.mem.Allocator, path: []const u8, content: []const u8, old_string: []const u8) ![]u8 {
+    const token = usefulToken(old_string) orelse return std.fmt.allocPrint(allocator, "Error: oldString not found in {s}", .{path});
+
+    var result = std.ArrayList(u8).empty;
+    errdefer result.deinit(allocator);
+    try result.print(allocator, "Error: oldString not found in {s}", .{path});
+
+    var shown: usize = 0;
+    var it = lineIterator(content);
+    while (it.next()) |line| {
+        if (containsIgnoreCase(line.text, token)) {
+            if (shown == 0) try result.print(allocator, "\nNearby candidates containing '{s}':", .{token});
+            const trimmed = std.mem.trim(u8, line.text, " \t\r\n");
+            const display = trimmed[0..@min(trimmed.len, 120)];
+            try result.print(allocator, "\n  line {d}: {s}", .{ line.number, display });
+            shown += 1;
+            if (shown == 5) break;
+        }
+    }
+
+    return result.toOwnedSlice(allocator);
+}
+
+fn usefulToken(text: []const u8) ?[]const u8 {
+    var start: ?usize = null;
+    for (text, 0..) |c, i| {
+        if (std.ascii.isAlphanumeric(c) or c == '_' or c == '-') {
+            if (start == null) start = i;
+        } else if (start) |s| {
+            if (i - s >= 2) return text[s..i];
+            start = null;
+        }
+    }
+    if (start) |s| {
+        if (text.len - s >= 2) return text[s..];
+    }
+    return null;
+}
+
+fn containsIgnoreCase(haystack: []const u8, needle: []const u8) bool {
+    if (needle.len == 0) return true;
+    if (needle.len > haystack.len) return false;
+    var i: usize = 0;
+    while (i + needle.len <= haystack.len) : (i += 1) {
+        if (std.ascii.eqlIgnoreCase(haystack[i .. i + needle.len], needle)) return true;
+    }
+    return false;
 }
 
 /// Compute a side-by-side diff between old and new content

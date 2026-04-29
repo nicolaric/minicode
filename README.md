@@ -1,83 +1,111 @@
-# zig-agent
+# minicode
 
-Minimal local coding agent written in Zig. It chats with a local Ollama model and supports a small JSON tool protocol for basic coding tasks.
+`minicode` is a minimal local coding agent written in Zig. It runs in a full-screen terminal UI, chats with a local Ollama model, streams responses, and lets the model request a small set of file and shell tools through JSON tool calls.
 
-## Requirements
+The repository/package name is currently `nic_agent`, but the executable and Zig build target are `minicode`.
+
+## Prerequisites
 
 - Zig 0.15.x
-- Ollama running locally
-- Linux or macOS terminal
+- Ollama
+- `curl` available on `PATH`
+- macOS or Linux terminal
 
-## Install And Run Ollama
+Windows is not currently documented as a supported platform.
 
-Install Ollama from <https://ollama.com/download>, then start it:
+## Ollama setup
+
+Install Ollama from <https://ollama.com/download>, then start the service:
 
 ```bash
 ollama serve
 ```
 
-In another terminal, pull a coding model:
+In another terminal, pull the default coding model:
 
 ```bash
 ollama pull qwen3.6:27b-coding-nvfp4
 ```
 
-Run the agent:
-
-```bash
-OLLAMA_MODEL=qwen3.6:27b-coding-nvfp4 zig build run
-```
-
-By default, `zig-agent` uses:
+By default, `minicode` uses:
 
 - `OLLAMA_BASE_URL=http://127.0.0.1:11434`
 - `OLLAMA_MODEL=qwen3.6:27b-coding-nvfp4`
 
-## Usage
+Override them when needed:
+
+```bash
+OLLAMA_BASE_URL=http://127.0.0.1:11434 OLLAMA_MODEL=qwen3.6:27b-coding-nvfp4 zig build run
+```
+
+Syntax highlighting is enabled by default. Set `NIC_SYNTAX_HIGHLIGHTING` to a truthy value (`true`, `1`, or `yes`) to enable it explicitly; any other value disables it.
+
+## Build and run
+
+Build the executable:
+
+```bash
+zig build
+```
+
+Run from source:
 
 ```bash
 zig build run
 ```
 
-The app opens a full-screen terminal UI using the alternate screen and a Catppuccin Mocha truecolor theme. Type messages in the single-line input field at the bottom. Use `/exit` or `/quit` to leave.
-
-Example with qwen3.6:
+After building, the installed executable is available at:
 
 ```bash
-ollama pull qwen3.6:27b-coding-nvfp4
-OLLAMA_MODEL=qwen3.6:27b-coding-nvfp4 zig build run
+./zig-out/bin/minicode
 ```
 
-## Tools
+## Terminal UI controls
 
-The model can request tools by replying with only JSON:
+`minicode` opens a full-screen alternate terminal UI. The input line is at the bottom of the screen.
+
+- `Enter`: send the current message
+- `/exit` or `/quit`: exit
+- `Ctrl+C`: exit while idle; cancel the current stream/tool turn while busy
+- `Esc`: cancel while busy
+- `Up` / `Down`: scroll the transcript
+- `PageUp` / `PageDown`: scroll by a page
+- `Left` / `Right`: move the input cursor
+- `Backspace`: delete the character before the cursor
+
+While the agent is busy streaming, new messages are not submitted. Draft input is kept and can be sent after the busy turn finishes or is cancelled.
+
+## Supported tools
+
+The model can request tools by replying with JSON such as:
 
 ```json
-{
-  "tool": "read_file",
-  "args": {
-    "path": "src/main.zig"
-  }
-}
+{"tool":"read_file","args":{"path":"src/main.zig"}}
 ```
 
 Supported tools:
 
-- `read_file(path, offset?, limit?)` reads 100 numbered lines from offset
-- `write_file(path, content)` shows a numbered diff when overwriting
-- `list_files(path)`
-- `run_shell(command)`
-- `grep(pattern, path?, include?)` returns matches with line numbers and supports simple `a|b` alternation, not full regex
-- `edit(path, oldString, newString)` shows a numbered diff
+- `read_file(path, offset?, limit?)`: read numbered file lines. `offset` defaults to line 1; `limit` defaults to 300 and is capped at 300.
+- `write_file(path, content)`: create or overwrite a file. Overwriting an existing file requires confirmation and reports a diff.
+- `list_files(path?)`: list directory contents. `path` defaults to the current directory.
+- `run_shell(command)`: run a shell command after confirmation.
+- `glob(pattern, path?)`: list files matching a glob pattern, optionally from `path`.
+- `grep(pattern, path?, include?, case_sensitive?, context?)`: search file contents. Matching is case-insensitive by default and supports basic regex features such as `.`, character classes, anchors, and `*`, `+`, `?`; results are capped at 20 matches.
+- `edit(path, oldString, newString)`: replace a unique text match in a file and report a diff.
 
-Safety behavior:
+## Safety behavior
 
-- Shell commands are shown and require confirmation before running.
-- Existing files require confirmation before overwrite.
-- File operations are restricted to relative paths inside the current working directory.
+- File paths must be relative and stay inside the current working directory.
+- Absolute paths and parent-directory traversal (`..`) are rejected.
+- Shell commands require confirmation before running.
+- Overwriting existing files requires confirmation.
+- Invalid tool JSON, unknown tools, invalid arguments, and invalid paths return tool errors instead of being executed.
+- Tool calls and results are logged locally to `~/Library/Logs/minicode/tool-calls.log` on macOS, or to `$XDG_STATE_HOME/minicode/logs/tool-calls.log` / `~/.local/state/minicode/logs/tool-calls.log` on Linux. Avoid asking the agent to read, print, or operate on secrets unless you are comfortable with those values appearing in local logs.
 
-## Build
+## Troubleshooting
 
-```bash
-zig build
-```
+- **Ollama is not running:** start it with `ollama serve`, then run `zig build run` again.
+- **Model missing or unavailable:** pull the default model with `ollama pull qwen3.6:27b-coding-nvfp4`, or set `OLLAMA_MODEL` to a model that exists locally.
+- **Custom Ollama endpoint fails:** check `OLLAMA_BASE_URL` and confirm the endpoint exposes Ollama's `/api/chat` API.
+- **`curl` is missing:** install `curl` and ensure it is available on `PATH`; streaming uses the `curl` command.
+- **Terminal display or input issues:** use a macOS or Linux terminal with alternate-screen and ANSI escape support, then restart the app to restore terminal state if needed.
