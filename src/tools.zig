@@ -1,5 +1,7 @@
 const std = @import("std");
 
+const testing = std.testing;
+
 pub const ToolRequest = struct {
     tool: []const u8,
     args: std.json.Value,
@@ -26,6 +28,29 @@ pub fn parseToolRequest(allocator: std.mem.Allocator, text: []const u8) !?std.js
 
 pub fn execute(allocator: std.mem.Allocator, req: ToolRequest) ![]u8 {
     return executeWithConfirm(allocator, req, null);
+}
+
+test "write_file creates a file" {
+    const path = ".tmp-write-tool-test.txt";
+    std.Io.Dir.cwd().deleteFile(std.Options.debug_io, path) catch |err| switch (err) {
+        error.FileNotFound => {},
+        else => return err,
+    };
+    defer std.Io.Dir.cwd().deleteFile(std.Options.debug_io, path) catch {};
+
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const allocator = arena.allocator();
+
+    var args = try std.json.ObjectMap.init(allocator, &.{}, &.{});
+    try args.put(allocator, "path", .{ .string = path });
+    try args.put(allocator, "content", .{ .string = "hello\n" });
+
+    const result = try execute(allocator, .{ .tool = "write_file", .args = .{ .object = args } });
+    try testing.expect(std.mem.indexOf(u8, result, "Created") != null);
+
+    const content = try std.Io.Dir.cwd().readFileAlloc(std.Options.debug_io, path, allocator, .limited(1024));
+    try testing.expectEqualStrings("hello\n", content);
 }
 
 pub fn executeWithConfirm(allocator: std.mem.Allocator, req: ToolRequest, confirmer: ?Confirm) ![]u8 {
