@@ -382,6 +382,8 @@ const App = struct {
 
             // Check for tool request - handle case where there's text before the JSON
             var maybe_tool: ?std.json.Parsed(tools.ToolRequest) = null;
+            var extracted_json: ?[]u8 = null;
+            defer if (extracted_json) |json| self.allocator.free(json);
 
             // Try to parse as-is first
             if (try tools.parseToolRequest(self.allocator, final_content)) |parsed| {
@@ -389,7 +391,7 @@ const App = struct {
             } else if (containsToolJson(final_content)) {
                 // Extract just the JSON part
                 if (extractToolJson(self.allocator, final_content)) |json_part| {
-                    defer self.allocator.free(json_part);
+                    extracted_json = json_part;
                     if (try tools.parseToolRequest(self.allocator, json_part)) |parsed| {
                         maybe_tool = parsed;
                     }
