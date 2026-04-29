@@ -335,6 +335,7 @@ const App = struct {
 
     fn completeTurn(self: *App, initial_stream_start: usize) !void {
         var stream_start = initial_stream_start;
+        var thinking_only_retries: usize = 0;
 
         // Add spacing between user message and response
         try self.addLine("", .{});
@@ -371,9 +372,17 @@ const App = struct {
                 return;
             }
             
-            // If only thinking was received, use thinking as content
             if (self.stream_content.items.len == 0 and self.stream_thinking.items.len > 0) {
-                try self.stream_content.appendSlice(self.allocator, self.stream_thinking.items);
+                if (thinking_only_retries >= 2) {
+                    try self.addLine("(no response)", .{});
+                    return;
+                }
+                thinking_only_retries += 1;
+
+                const continue_message = try self.allocator.dupe(u8, "Continue. If you need a tool, output only the tool JSON. Otherwise answer normally.");
+                try self.messages.append(self.allocator, .{ .role = .user, .content = continue_message });
+                stream_start = self.lines.items.len;
+                continue;
             }
 
             const final_content = try self.allocator.dupe(u8, self.stream_content.items);

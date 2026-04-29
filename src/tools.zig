@@ -53,6 +53,33 @@ test "write_file creates a file" {
     try testing.expectEqualStrings("hello\n", content);
 }
 
+test "grep searches a single file path" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const allocator = arena.allocator();
+
+    var args = try std.json.ObjectMap.init(allocator, &.{}, &.{});
+    try args.put(allocator, "path", .{ .string = "src/tui.zig" });
+    try args.put(allocator, "pattern", .{ .string = "renderPrompt" });
+
+    const result = try execute(allocator, .{ .tool = "grep", .args = .{ .object = args } });
+    try testing.expect(std.mem.indexOf(u8, result, "renderPrompt") != null);
+    try testing.expect(std.mem.indexOf(u8, result, "Found") != null);
+}
+
+test "grep supports simple alternation" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const allocator = arena.allocator();
+
+    var args = try std.json.ObjectMap.init(allocator, &.{}, &.{});
+    try args.put(allocator, "path", .{ .string = "src/tui.zig" });
+    try args.put(allocator, "pattern", .{ .string = "definitely_not_here|renderPrompt" });
+
+    const result = try execute(allocator, .{ .tool = "grep", .args = .{ .object = args } });
+    try testing.expect(std.mem.indexOf(u8, result, "renderPrompt") != null);
+}
+
 pub fn executeWithConfirm(allocator: std.mem.Allocator, req: ToolRequest, confirmer: ?Confirm) ![]u8 {
     if (std.mem.eql(u8, req.tool, "read_file")) return readFile(allocator, getStringArg(req.args, "path") orelse return error.InvalidToolArgs, getUsizeArg(req.args, "offset"), getUsizeArg(req.args, "limit"));
     if (std.mem.eql(u8, req.tool, "write_file")) return writeFile(
