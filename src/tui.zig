@@ -11,6 +11,16 @@ const thinking_marker = "\x1fT";
 const user_marker = "\x1fU";
 const max_input = 16 * 1024;
 
+const minicode_banner = "";
+
+const welcome_title_lines = [_][]const u8{
+    "███    ███ ██ ███    ██ ██  ██████  ██████  ██████  ███████ ",
+    "████  ████ ██ ████   ██ ██ ██      ██    ██ ██   ██ ██      ",
+    "██ ████ ██ ██ ██ ██  ██ ██ ██      ██    ██ ██   ██ █████   ",
+    "██  ██  ██ ██ ██  ██ ██ ██ ██      ██    ██ ██   ██ ██      ",
+    "██      ██ ██ ██   ████ ██  ██████  ██████  ██████  ███████ ",
+};
+
 const App = struct {
     allocator: std.mem.Allocator,
     cfg: config.Config,
@@ -29,8 +39,11 @@ const App = struct {
     stream_thinking: std.ArrayList(u8),
     stream_lines_start: usize,
     thinking_started: bool,
+    read_requests: std.ArrayList([]u8),
     // Syntax highlighter
     highlighter: ?*syntax_highlight.SyntaxHighlighter,
+    // Welcome screen state
+    show_welcome: bool,
 
     fn init(allocator: std.mem.Allocator, cfg: config.Config) !App {
         const highlighter = try syntax_highlight.SyntaxHighlighter.create(allocator);
@@ -51,7 +64,9 @@ const App = struct {
             .stream_thinking = .empty,
             .stream_lines_start = 0,
             .thinking_started = false,
+            .read_requests = .empty,
             .highlighter = highlighter,
+            .show_welcome = true,
         };
     }
 
@@ -63,6 +78,8 @@ const App = struct {
         self.input.deinit(self.allocator);
         self.stream_content.deinit(self.allocator);
         self.stream_thinking.deinit(self.allocator);
+        self.clearReadRequests();
+        self.read_requests.deinit(self.allocator);
         if (self.highlighter) |h| h.destroy();
     }
 
@@ -79,15 +96,13 @@ const App = struct {
             var byte: [1]u8 = undefined;
             if (try stdin.readSliceShort(&byte) == 0) break;
             switch (byte[0]) {
-                3 => { // Ctrl+C
-                    if (self.input.items.len > 0 and !self.input_cleared) {
-                        self.input.clearRetainingCapacity();
-                        self.cursor_pos = 0;
-                        self.input_cleared = true;
+                3 => { // Ctrl+C - exit the app (cancel streaming if active)
+                    if (self.is_busy) {
+                        self.cancel_requested = true;
                         try self.render();
-                    } else {
-                        break;
+                        continue;
                     }
+                    break;
                 },
                 23 => { // Ctrl+W - scroll up
                     self.scrollUp(self.getContentRows());
@@ -98,6 +113,10 @@ const App = struct {
                     try self.render();
                 },
                 '\r', '\n' => {
+                    if (self.is_busy) {
+                        // While streaming we keep the draft input intact.
+                        continue;
+                    }
                     const trimmed = std.mem.trim(u8, self.input.items, " \t\r\n");
                     if (trimmed.len == 0) {
                         self.input.clearRetainingCapacity();
@@ -107,6 +126,11 @@ const App = struct {
                         continue;
                     }
                     if (std.mem.eql(u8, trimmed, "/exit") or std.mem.eql(u8, trimmed, "/quit")) break;
+
+                    // Switch from welcome screen to normal view on first message
+                    const is_first_message = self.show_welcome;
+                    self.show_welcome = false;
+
                     const user_text = try self.allocator.dupe(u8, trimmed);
                     const safe_user_text = try sanitizeAlloc(self.allocator, user_text);
                     defer self.allocator.free(safe_user_text);
@@ -115,6 +139,12 @@ const App = struct {
                     self.scroll_offset = 0;
                     self.input_cleared = false;
                     self.is_busy = true;
+
+                    // Only add spacing if not first message
+                    if (!is_first_message and self.lines.items.len > 0) {
+                        try self.addLine("", .{});
+                    }
+
                     try self.addUserBlock(safe_user_text);
                     try self.messages.append(self.allocator, .{ .role = .user, .content = user_text });
                     const stream_start = self.lines.items.len;
@@ -336,6 +366,7 @@ const App = struct {
     fn completeTurn(self: *App, initial_stream_start: usize) !void {
         var stream_start = initial_stream_start;
         var thinking_only_retries: usize = 0;
+        self.clearReadRequests();
 
         // Add spacing between user message and response
         try self.addLine("", .{});
@@ -409,25 +440,48 @@ const App = struct {
 
             if (maybe_tool) |*parsed| {
                 defer parsed.deinit();
+                if (textBeforeToolJson(final_content)) |text_before_tool| {
+                    if (std.mem.trim(u8, text_before_tool, " \t\r\n").len > 0) {
+                        try self.addAssistantBlock(std.mem.trim(u8, text_before_tool, " \t\r\n"));
+                    }
+                }
                 const safe_tool = try sanitizeAlloc(self.allocator, parsed.value.tool);
                 defer self.allocator.free(safe_tool);
 
                 const pending_summary = try self.formatToolDisplay(safe_tool, parsed.value.args);
                 defer self.allocator.free(pending_summary);
+                try self.addLine("", .{});
                 try self.addLine("{s}", .{pending_summary});
                 try self.render();
 
-                const result = tools.executeWithConfirm(self.allocator, parsed.value, .{
+                var tool_failed = false;
+                const result = if (try self.repeatedReadError(parsed.value)) |read_error| blk: {
+                    tool_failed = true;
+                    break :blk read_error;
+                } else tools.executeWithConfirm(self.allocator, parsed.value, .{
                     .ctx = self,
                     .callback = confirmCallback,
-                }) catch |err| try std.fmt.allocPrint(self.allocator, "Tool error: {s}", .{@errorName(err)});
+                }) catch |err| blk: {
+                    tool_failed = true;
+                    break :blk try std.fmt.allocPrint(self.allocator, "Tool error: {s}", .{@errorName(err)});
+                };
                 defer self.allocator.free(result);
+                if (std.mem.startsWith(u8, result, "Error:") or std.mem.startsWith(u8, result, "Tool error:")) {
+                    tool_failed = true;
+                }
 
                 // Show concise summary in UI
                 const summary = try self.formatToolResultSummary(safe_tool, parsed.value.args, result);
                 defer self.allocator.free(summary);
                 self.removeLineAt(self.lines.items.len - 1);
                 try self.addLine("{s}", .{summary});
+                if (tool_failed) {
+                    try self.addToolError(result);
+                }
+                if (std.mem.eql(u8, safe_tool, "edit") or std.mem.eql(u8, safe_tool, "write_file")) {
+                    try self.addToolResultDetails(result);
+                }
+                try self.addLine("", .{});
 
                 // Send full result to agent
                 const tool_message = try std.fmt.allocPrint(self.allocator, "Result from tool `{s}`. Use this result to continue; do not repeat the same tool call unless you need a different offset, limit, path, or pattern.\n{s}", .{ parsed.value.tool, result });
@@ -438,13 +492,224 @@ const App = struct {
                 continue;
             }
 
+            if (containsToolAttempt(final_content)) {
+                const error_message = "Error: Invalid tool JSON. Expected {\"tool\":\"TOOL_NAME\",\"args\":{...}}";
+                try self.addLine("", .{});
+                try self.addToolError(error_message);
+                try self.addLine("", .{});
+                const retry_message = try self.allocator.dupe(u8, error_message);
+                try self.messages.append(self.allocator, .{ .role = .user, .content = retry_message });
+                try self.render();
+                stream_start = self.lines.items.len;
+                continue;
+            }
+
             return;
         }
 
     }
 
-    fn shouldCancelCallback(self: *App) bool {
+    fn shouldCancelCallback(self: *App) !bool {
+        try self.processPendingInputWhileBusy();
         return self.cancel_requested;
+    }
+
+    fn processPendingInputWhileBusy(self: *App) !void {
+        var needs_render = false;
+
+        while (true) {
+            const next = try self.readPendingByte();
+            if (next == null) break;
+            const ch = next.?;
+
+            switch (ch) {
+                3 => { // Ctrl+C
+                    self.cancel_requested = true;
+                    needs_render = true;
+                },
+                '\r', '\n' => {
+                    // No-op while busy: keep editing, do not submit.
+                },
+                1 => { // Ctrl+A
+                    self.cursor_pos = 0;
+                    needs_render = true;
+                },
+                5 => { // Ctrl+E
+                    self.cursor_pos = self.input.items.len;
+                    needs_render = true;
+                },
+                127, 8 => {
+                    if (self.cursor_pos > 0 and self.input.items.len > 0) {
+                        _ = self.input.orderedRemove(self.cursor_pos - 1);
+                        self.cursor_pos -= 1;
+                        needs_render = true;
+                    }
+                },
+                27 => {
+                    if (try self.handleBusyEscapeSequence()) needs_render = true;
+                },
+                else => {
+                    if (ch >= 32 and ch != 127 and self.input.items.len < max_input) {
+                        try self.input.insert(self.allocator, self.cursor_pos, ch);
+                        self.cursor_pos += 1;
+                        needs_render = true;
+                    }
+                },
+            }
+        }
+
+        if (needs_render) try self.render();
+    }
+
+    fn readPendingByte(self: *App) !?u8 {
+        _ = self;
+        var fds = [_]std.posix.pollfd{.{ .fd = std.posix.STDIN_FILENO, .events = std.posix.POLL.IN, .revents = 0 }};
+        const ready = std.posix.poll(&fds, 0) catch 0;
+        if (ready <= 0 or (fds[0].revents & std.posix.POLL.IN) == 0) return null;
+
+        var byte: [1]u8 = undefined;
+        const n = std.posix.read(std.posix.STDIN_FILENO, &byte) catch return null;
+        if (n == 0) return null;
+        return byte[0];
+    }
+
+    fn handleBusyEscapeSequence(self: *App) !bool {
+        const seq0 = try self.readPendingByte();
+        if (seq0 == null) {
+            self.cancel_requested = true;
+            return true;
+        }
+
+        // Treat bare ESC or Alt+Esc as stream cancellation. Arrow/function-key
+        // escape sequences still start with '[' and continue below.
+        if (seq0.? == 27) {
+            self.cancel_requested = true;
+            return true;
+        }
+
+        if (seq0.? == '[') {
+            const seq1 = try self.readPendingByte();
+            if (seq1 == null) {
+                self.cancel_requested = true;
+                return true;
+            }
+
+            switch (seq1.?) {
+                'D' => {
+                    if (self.cursor_pos > 0) self.cursor_pos -= 1;
+                    return true;
+                },
+                'C' => {
+                    if (self.cursor_pos < self.input.items.len) self.cursor_pos += 1;
+                    return true;
+                },
+                'H' => {
+                    self.cursor_pos = 0;
+                    return true;
+                },
+                'F' => {
+                    self.cursor_pos = self.input.items.len;
+                    return true;
+                },
+                '3' => {
+                    const maybe_tilde = try self.readPendingByte();
+                    if (maybe_tilde != null and maybe_tilde.? == '~') {
+                        if (self.cursor_pos < self.input.items.len) {
+                            _ = self.input.orderedRemove(self.cursor_pos);
+                        }
+                        return true;
+                    }
+                    return false;
+                },
+                '1', '7' => {
+                    const maybe_tilde = try self.readPendingByte();
+                    if (maybe_tilde != null and maybe_tilde.? == '~') {
+                        self.cursor_pos = 0;
+                        return true;
+                    }
+                    return false;
+                },
+                '4', '8' => {
+                    const maybe_tilde = try self.readPendingByte();
+                    if (maybe_tilde != null and maybe_tilde.? == '~') {
+                        self.cursor_pos = self.input.items.len;
+                        return true;
+                    }
+                    return false;
+                },
+                else => return false,
+            }
+        }
+
+        switch (seq0.?) {
+            'b' => {
+                self.moveCursorWordLeft();
+                return true;
+            },
+            'f' => {
+                self.moveCursorWordRight();
+                return true;
+            },
+            127, 8 => {
+                self.deleteWordLeft();
+                return true;
+            },
+            else => return false,
+        }
+    }
+
+    fn clearReadRequests(self: *App) void {
+        for (self.read_requests.items) |key| self.allocator.free(key);
+        self.read_requests.clearRetainingCapacity();
+    }
+
+    fn repeatedReadError(self: *App, request: tools.ToolRequest) !?[]u8 {
+        if (!std.mem.eql(u8, request.tool, "read_file")) return null;
+        if (request.args != .object) return null;
+
+        const path_value = request.args.object.get("path") orelse return null;
+        if (path_value != .string) return null;
+        const path = path_value.string;
+
+        var offset: usize = 1;
+        if (request.args.object.get("offset")) |offset_value| {
+            if (offset_value == .integer and offset_value.integer > 0) {
+                offset = @intCast(offset_value.integer);
+            }
+        }
+
+        const key = try std.fmt.allocPrint(self.allocator, "{s}:{d}", .{ path, offset });
+        errdefer self.allocator.free(key);
+        for (self.read_requests.items) |seen| {
+            if (std.mem.eql(u8, seen, key)) {
+                self.allocator.free(key);
+                return try std.fmt.allocPrint(
+                    self.allocator,
+                    "Error: Already read {s} at offset={d} in this turn. Use grep, use a different offset, or continue with offset={d}.",
+                    .{ path, offset, offset + 100 },
+                );
+            }
+        }
+        try self.read_requests.append(self.allocator, key);
+        return null;
+    }
+
+    fn addToolResultDetails(self: *App, result: []const u8) !void {
+        var it = std.mem.splitScalar(u8, result, '\n');
+        while (it.next()) |line| {
+            const safe_line = try sanitizeAlloc(self.allocator, line);
+            defer self.allocator.free(safe_line);
+            try self.addLine("  {s}", .{safe_line});
+        }
+    }
+
+    fn addToolError(self: *App, result: []const u8) !void {
+        var it = std.mem.splitScalar(u8, result, '\n');
+        while (it.next()) |line| {
+            const safe_line = try sanitizeAlloc(self.allocator, line);
+            defer self.allocator.free(safe_line);
+            try self.addLine("  {s}{s}{s}", .{ theme.mocha.red, safe_line, theme.reset });
+        }
     }
 
     fn streamingCallback(self: *App, chunk: ollama.StreamChunk) !void {
@@ -500,9 +765,15 @@ const App = struct {
             if (try tools.parseToolRequest(self.allocator, self.stream_content.items)) |*parsed| {
                 // Valid tool JSON - hide it (will be processed at end of turn)
                 parsed.deinit();
-            } else if (containsToolJson(self.stream_content.items)) {
-                // Content contains tool JSON somewhere (possibly with text before it)
-                // Hide everything - the tool will be extracted and executed at end of turn
+            } else if (containsToolAttempt(self.stream_content.items)) {
+                if (textBeforeToolJson(self.stream_content.items)) |text_before_tool| {
+                    if (std.mem.trim(u8, text_before_tool, " \t\r\n").len > 0) {
+                        if (self.stream_thinking.items.len > 0) {
+                            try self.addLine("", .{});
+                        }
+                        try self.addAssistantBlock(std.mem.trim(u8, text_before_tool, " \t\r\n"));
+                    }
+                }
             } else {
                 // No tool JSON in content - display as normal text
                 if (self.stream_thinking.items.len > 0) {
@@ -645,6 +916,9 @@ const App = struct {
         } else if (std.mem.eql(u8, tool_name, "grep")) {
             const pattern = main_arg orelse "unknown";
             const display_pattern = if (pattern.len > 20) pattern[0..20] else pattern;
+            if (std.mem.startsWith(u8, result, "Error")) {
+                return std.fmt.allocPrint(self.allocator, "* Grep \"{s}\" [failed]", .{display_pattern});
+            }
             // Count matches from "Found X matches" in result
             var match_count: usize = 0;
             if (std.mem.startsWith(u8, result, "Found ")) {
@@ -654,6 +928,16 @@ const App = struct {
                 }
             }
             if (match_count == 0) {
+                var files_searched: usize = 0;
+                if (std.mem.indexOf(u8, result, " in ")) |match_start| {
+                    var i = match_start + 4;
+                    while (i < result.len and result[i] >= '0' and result[i] <= '9') : (i += 1) {
+                        files_searched = files_searched * 10 + (result[i] - '0');
+                    }
+                }
+                if (files_searched > 0) {
+                    return std.fmt.allocPrint(self.allocator, "* Grep \"{s}\" [no matches, {d} files]", .{ display_pattern, files_searched });
+                }
                 return std.fmt.allocPrint(self.allocator, "* Grep \"{s}\" [no matches]", .{display_pattern});
             } else {
                 return std.fmt.allocPrint(self.allocator, "* Grep \"{s}\" [{d} matches]", .{ display_pattern, match_count });
@@ -707,27 +991,55 @@ const App = struct {
         return false;
     }
 
+    fn toolJsonStart(text: []const u8) ?usize {
+        if (std.mem.indexOf(u8, text, "\"tool\"") == null) return null;
+        var index: usize = 0;
+        while (index < text.len) : (index += 1) {
+            if (text[index] != '{') continue;
+            const remaining = text[index..];
+            if (remaining.len > 8 and
+                (std.mem.startsWith(u8, remaining, "{\"tool\"") or
+                    std.mem.startsWith(u8, remaining, "{\n\"tool\"") or
+                    std.mem.startsWith(u8, remaining, "{ \"tool\"")))
+            {
+                return index;
+            }
+        }
+        return null;
+    }
+
+    fn textBeforeToolJson(text: []const u8) ?[]const u8 {
+        const json_start = toolJsonStart(text) orelse return null;
+        return text[0..json_start];
+    }
+
+    fn containsToolAttempt(text: []const u8) bool {
+        if (containsToolJson(text)) return true;
+        if (std.mem.indexOfScalar(u8, text, '{') == null) return false;
+        return containsQuotedKnownTool(text);
+    }
+
+    fn containsQuotedKnownTool(text: []const u8) bool {
+        const known = [_][]const u8{
+            "read_file",
+            "write_file",
+            "list_files",
+            "run_shell",
+            "glob",
+            "grep",
+            "edit",
+        };
+        for (known) |tool_name| {
+            if (std.mem.indexOf(u8, text, tool_name)) |_| return true;
+        }
+        return false;
+    }
+
     fn extractToolJson(allocator: std.mem.Allocator, text: []const u8) ?[]u8 {
         // Find and extract the JSON object containing "tool"
         if (std.mem.indexOf(u8, text, "\"tool\"") == null) return null;
 
-        // Find the start of the JSON object
-        var json_start: usize = 0;
-        while (json_start < text.len) : (json_start += 1) {
-            if (text[json_start] == '{') {
-                const remaining = text[json_start..];
-                // Check if this looks like a tool object
-                if (remaining.len > 8) {
-                    if (std.mem.startsWith(u8, remaining, "{\"tool\"") or
-                        std.mem.startsWith(u8, remaining, "{\n\"tool\"") or
-                        std.mem.startsWith(u8, remaining, "{ \"tool\"")) {
-                        break;
-                    }
-                }
-            }
-        }
-
-        if (json_start >= text.len) return null;
+        const json_start = toolJsonStart(text) orelse return null;
 
         // Find the matching closing brace
         var brace_depth: usize = 0;
@@ -1012,7 +1324,9 @@ const App = struct {
                 // Regular text line
                 const safe_line = try sanitizeAlloc(self.allocator, line);
                 defer self.allocator.free(safe_line);
-                try self.addLine("{s}", .{safe_line});
+                const styled_line = try styleMarkdownLine(self.allocator, safe_line);
+                defer self.allocator.free(styled_line);
+                try self.addLine("{s}", .{styled_line});
             }
         }
 
@@ -1059,7 +1373,181 @@ const App = struct {
     }
 
     fn render(self: *App) !void {
-        try self.renderPrompt("message");
+        if (self.show_welcome) {
+            try self.renderWelcome();
+        } else {
+            try self.renderPrompt("message");
+        }
+    }
+
+    fn renderWelcome(self: *App) !void {
+        var stdout_buf: [16384]u8 = undefined;
+        var stdout_file = std.Io.File.stdout().writerStreaming(std.Options.debug_io, &stdout_buf);
+        const stdout = &stdout_file.interface;
+        defer stdout.flush() catch {};
+
+        const size = terminal.size();
+        if (size.rows < 20 or size.cols < 80) {
+            try stdout.writeAll("\x1b[H\x1b[2J");
+            try stdout.print("{s}{s}Terminal too small (need 20x80){s}\x1b[1;1H\x1b[?25h", .{ theme.mocha.mantle_bg, theme.mocha.text, theme.reset });
+            return;
+        }
+
+        const rows = size.rows;
+        const cols = size.cols;
+
+        try stdout.print("\x1b[?25l{s}\x1b[H", .{theme.mocha.mantle_bg});
+
+        // Split banner into lines
+        var banner_lines = std.ArrayList([]const u8).empty;
+        defer banner_lines.deinit(self.allocator);
+
+        var banner_it = std.mem.splitScalar(u8, minicode_banner, '\n');
+        while (banner_it.next()) |line| {
+            try banner_lines.append(self.allocator, line);
+        }
+
+        // Calculate layout
+        const banner_height = banner_lines.items.len;
+        const title_height = welcome_title_lines.len;
+        const input_box_height = 3; // top border + middle row + bottom border
+        const title_to_input_gap: usize = 3;
+        const input_section_height = title_height + title_to_input_gap + input_box_height; // title + gap + input box
+        const cool_stuff_height = 0;
+        const gap_height = 2;
+        const total_content_height = input_section_height + cool_stuff_height + gap_height + banner_height;
+
+        // Calculate top margin to center everything
+        const vertical_lift: usize = 2;
+        const centered_top_margin = (rows - total_content_height) / 2;
+        const top_margin = if (centered_top_margin > vertical_lift)
+            centered_top_margin - vertical_lift
+        else
+            0;
+
+        // Print top margin
+        var row: usize = 0;
+        while (row < top_margin) : (row += 1) {
+            try stdout.print("{s}\x1b[K\n", .{theme.mocha.mantle_bg});
+        }
+
+        // Calculate centered input box dimensions
+        const input_width: usize = 70;
+        const input_left_margin = (cols - input_width) / 2;
+
+        // Print welcome title as one centered block (fixed left edge)
+        var max_title_width: usize = 0;
+        for (welcome_title_lines) |line| {
+            if (line.len > max_title_width) max_title_width = line.len;
+        }
+        const title_shift_right: usize = 5;
+        const title_left_margin_base = if (max_title_width >= input_width)
+            input_left_margin
+        else
+            input_left_margin + (input_width - max_title_width) / 2;
+        const title_left_margin = title_left_margin_base + title_shift_right;
+        for (welcome_title_lines) |line| {
+            try stdout.print("{s}", .{theme.mocha.mantle_bg});
+            try stdout.splatByteAll(' ', title_left_margin);
+            const display_line = if (line.len > cols) line[0..cols] else line;
+            try stdout.print("{s}{s}{s}{s}\x1b[K{s}\n", .{ theme.mocha.subtext0, display_line, theme.reset, theme.mocha.mantle_bg, theme.reset });
+        }
+        var gap_line: usize = 0;
+        while (gap_line < title_to_input_gap) : (gap_line += 1) {
+            try stdout.print("{s}\x1b[K\n", .{theme.mocha.mantle_bg});
+        }
+
+        // Print input box - centered
+        try self.printWelcomeInputArea(stdout, input_width, input_left_margin);
+
+        // Spacing
+        try stdout.print("{s}\x1b[K\n", .{theme.mocha.mantle_bg});
+        try stdout.print("{s}\x1b[K\n", .{theme.mocha.mantle_bg});
+
+        // Gap before banner
+        const remaining_rows = rows - (top_margin + input_section_height + cool_stuff_height + banner_height);
+        var gap_row: usize = 0;
+        while (gap_row < remaining_rows) : (gap_row += 1) {
+            try stdout.print("{s}\x1b[K\n", .{theme.mocha.mantle_bg});
+        }
+
+        // Print banner at bottom
+        for (banner_lines.items) |line| {
+            try stdout.print("{s}", .{theme.mocha.mantle_bg});
+            // Center the banner (or left-align if too wide)
+            const banner_margin = if (line.len >= cols) 0 else (cols - line.len) / 2;
+            try stdout.splatByteAll(' ', banner_margin);
+            // Truncate line if it's too wide for terminal
+            const display_line = if (line.len > cols) line[0..cols] else line;
+            try stdout.print("{s}{s}{s}", .{ theme.mocha.lavender, display_line, theme.reset });
+            try stdout.print("{s}\x1b[K\n", .{theme.mocha.mantle_bg});
+        }
+
+        // Position cursor in the input box (single row, scrolls horizontally)
+        const content_width = if (input_width > 2) input_width - 2 else 1;
+        const window_start = if (self.cursor_pos >= content_width)
+            self.cursor_pos - content_width + 1
+        else
+            0;
+        const cursor_col_in_box = self.cursor_pos - window_start;
+        const input_row = top_margin + welcome_title_lines.len + 2; // Middle row on welcome input box
+        const cursor_col = input_left_margin + 3 + cursor_col_in_box; // After lavender border + one empty column
+        try stdout.print("\x1b[{d};{d}H\x1b[?25h", .{ input_row, cursor_col });
+    }
+
+    fn printWelcomeInputArea(self: *App, stdout: anytype, input_width: usize, left_margin: usize) !void {
+        const border_cols: usize = 1;
+        const input_left_padding: usize = 1; // Keep first column inside box empty
+        const input_right_padding: usize = 0;
+        const input_prefix_cols = border_cols + input_left_padding;
+        const room_for_input: usize = if (input_width > input_prefix_cols + input_right_padding)
+            input_width - input_prefix_cols - input_right_padding
+        else
+            0;
+
+        // Determine visible window of input that includes the cursor
+        const window_start = if (room_for_input == 0)
+            self.cursor_pos
+        else if (self.cursor_pos >= room_for_input)
+            self.cursor_pos - room_for_input + 1
+        else
+            0;
+        const visible_len = if (room_for_input == 0) 0 else @min(room_for_input, self.input.items.len - window_start);
+        const visible_input = self.input.items[window_start .. window_start + visible_len];
+
+        // Top row of input box - lavender border left, dark background
+        try stdout.print("{s}", .{theme.mocha.mantle_bg});
+        try stdout.splatByteAll(' ', left_margin);
+        try stdout.print("{s}▌{s}", .{
+            theme.mocha.lavender,
+            theme.mocha.surface0_bg,
+        });
+        if (border_cols < input_width) try stdout.splatByteAll(' ', input_width - border_cols);
+        try stdout.print("{s}\x1b[K{s}\n", .{ theme.mocha.mantle_bg, theme.reset });
+
+        // Middle row with input text - lavender border left, dark background
+        try stdout.print("{s}", .{theme.mocha.mantle_bg});
+        try stdout.splatByteAll(' ', left_margin);
+        try stdout.print("{s}▌{s}", .{
+            theme.mocha.lavender,
+            theme.mocha.surface0_bg,
+        });
+        if (input_left_padding > 0) try stdout.splatByteAll(' ', input_left_padding);
+        try stdout.print("{s}{s}", .{ theme.mocha.text, visible_input });
+        const max_used_cols = input_width - input_right_padding;
+        const used_cols = @min(max_used_cols, input_prefix_cols + visible_input.len);
+        if (used_cols < max_used_cols) try stdout.splatByteAll(' ', max_used_cols - used_cols);
+        try stdout.print("{s}\x1b[K{s}\n", .{ theme.mocha.mantle_bg, theme.reset });
+
+        // Bottom row of input box - lavender border left, dark background
+        try stdout.print("{s}", .{theme.mocha.mantle_bg});
+        try stdout.splatByteAll(' ', left_margin);
+        try stdout.print("{s}▌{s}", .{
+            theme.mocha.lavender,
+            theme.mocha.surface0_bg,
+        });
+        if (border_cols < input_width) try stdout.splatByteAll(' ', input_width - border_cols);
+        try stdout.print("{s}\x1b[K{s}\n", .{ theme.mocha.mantle_bg, theme.reset });
     }
 
     fn renderPrompt(self: *App, prompt: []const u8) !void {
@@ -1079,14 +1567,14 @@ const App = struct {
         const left_margin: usize = 2;
         // Reserve space for the scrollbar plus row prefixes like "│ ", so
         // conversation text never renders underneath the scrollbar overlay.
-        const right_margin: usize = 4;
+        const right_margin: usize = 3;
         const inner_cols: usize = @max(4, @as(usize, cols) - left_margin - right_margin);
         self.inner_cols = inner_cols;
-        const input_rows: usize = 8;
-        const input_inner_cols = inner_cols;
+        const input_rows: usize = 6;
+        const input_inner_cols = if (inner_cols > 1) inner_cols - 1 else inner_cols;
         const content_rows: usize = rows - input_rows;
 
-        try stdout.print("\x1b[?25l{s}\x1b[H\x1b[2J", .{theme.mocha.mantle_bg});
+        try stdout.print("\x1b[?25l{s}\x1b[H", .{theme.mocha.mantle_bg});
 
         const wrapped_count = self.countWrappedRows(inner_cols);
         const max_scroll = if (wrapped_count > content_rows) wrapped_count - content_rows else 0;
@@ -1106,7 +1594,7 @@ const App = struct {
         const cursor_col = try self.printInputArea(stdout, prompt, input_inner_cols, left_margin);
         try stdout.print("{s}", .{theme.reset});
 
-        const input_row = rows - 2;
+        const input_row = rows - 4;
         try stdout.print("\x1b[{d};{d}H\x1b[?25h", .{ input_row, cursor_col });
     }
 
@@ -1230,12 +1718,7 @@ const App = struct {
     }
 
     fn printInputArea(self: *App, stdout: anytype, prompt: []const u8, inner_cols: usize, left_margin: usize) !usize {
-        const safe_prompt = try sanitizeAlloc(self.allocator, prompt);
-        defer self.allocator.free(safe_prompt);
-        const safe_model = try sanitizeAlloc(self.allocator, self.cfg.model);
-        defer self.allocator.free(safe_model);
-
-        const border = "│";
+        _ = prompt;
         const border_cols: usize = 1;
         const input_right_padding: usize = 1;
         const input_prefix_cols = border_cols + 1;
@@ -1255,42 +1738,39 @@ const App = struct {
         const visible_input = self.input.items[window_start .. window_start + visible_len];
         const cursor_in_visible = if (room_for_input == 0) 0 else self.cursor_pos - window_start;
 
+        // Top border - lavender left border, dark background
         try stdout.print("{s}", .{theme.mocha.mantle_bg});
         try self.writeMargin(stdout, left_margin);
-        try stdout.print("{s}{s}{s} {s}", .{
-            theme.mocha.base_bg,
+        try stdout.print("{s}▌{s}", .{
             theme.mocha.lavender,
-            border,
-            theme.mocha.text,
+            theme.mocha.surface0_bg,
         });
-        if (border_cols + 1 < inner_cols) try stdout.splatByteAll(' ', inner_cols - border_cols - 1);
-        try stdout.print("\x1b[K{s}\n", .{theme.reset});
+        if (border_cols < inner_cols) try stdout.splatByteAll(' ', inner_cols - border_cols);
+        try stdout.print("{s}\x1b[K{s}\n", .{ theme.mocha.mantle_bg, theme.reset });
 
-        // Keep the input row dedicated to editable text so cursor math stays tied to input only.
+        // Input row with text - lavender left border, dark background
         try stdout.print("{s}", .{theme.mocha.mantle_bg});
         try self.writeMargin(stdout, left_margin);
-        try stdout.print("{s}{s}{s} {s}{s}", .{
-            theme.mocha.base_bg,
+        try stdout.print("{s}▌{s} {s}{s}", .{
             theme.mocha.lavender,
-            border,
+            theme.mocha.surface0_bg,
             theme.mocha.text,
             visible_input,
         });
-        const used_cols = @min(inner_cols, input_prefix_cols + visible_input.len);
-        if (used_cols < inner_cols) try stdout.splatByteAll(' ', inner_cols - used_cols);
-        try stdout.print("\x1b[K{s}\n", .{theme.reset});
+        const max_used_cols = inner_cols - input_right_padding;
+        const used_cols = @min(max_used_cols, input_prefix_cols + visible_input.len);
+        if (used_cols < max_used_cols) try stdout.splatByteAll(' ', max_used_cols - used_cols);
+        try stdout.print("{s}\x1b[K{s}\n", .{ theme.mocha.mantle_bg, theme.reset });
 
-        // Bottom padding inside the input box so glyph descenders are not visually clipped.
+        // Bottom border - lavender left border, dark background
         try stdout.print("{s}", .{theme.mocha.mantle_bg});
         try self.writeMargin(stdout, left_margin);
-        try stdout.print("{s}{s}{s} {s}", .{
-            theme.mocha.base_bg,
+        try stdout.print("{s}▌{s}", .{
             theme.mocha.lavender,
-            border,
-            theme.mocha.text,
+            theme.mocha.surface0_bg,
         });
-        if (border_cols + 1 < inner_cols) try stdout.splatByteAll(' ', inner_cols - border_cols - 1);
-        try stdout.print("\x1b[K{s}\n", .{theme.reset});
+        if (border_cols < inner_cols) try stdout.splatByteAll(' ', inner_cols - border_cols);
+        try stdout.print("{s}\x1b[K{s}\n", .{ theme.mocha.mantle_bg, theme.reset });
 
         try self.printPendingLoader(stdout, inner_cols, left_margin);
 
@@ -1315,7 +1795,7 @@ const App = struct {
             var i: usize = 0;
             while (i < width) : (i += 1) {
                 if (i == active) {
-                    try stdout.print("{s}█", .{theme.mocha.lavender});
+                    try stdout.print("{s}■", .{theme.mocha.lavender});
                 } else {
                     try stdout.print("{s}▪", .{theme.mocha.surface0});
                 }
@@ -1331,24 +1811,34 @@ const App = struct {
 
     fn printUserRowWithMargin(self: *App, stdout: anytype, text: []const u8, left_margin: usize, is_first_row: bool) !void {
         _ = self;
+        _ = is_first_row;
         // Start with mantle background for margin area
         try stdout.print("{s}", .{theme.mocha.mantle_bg});
         // Write left margin spaces
         try stdout.splatByteAll(' ', left_margin);
-        // Then surface0 background for user message content
-        if (is_first_row) {
-            try stdout.print("{s}│{s} {s}", .{ theme.mocha.surface0_bg, theme.mocha.text, text });
-        } else {
-            // Continuation row - same surface0 background, space indent, no border
-            try stdout.print("{s} {s}", .{ theme.mocha.surface0_bg, text });
-        }
+        // User row matches input style: lavender left border + surface background + text
+        try stdout.print("{s}▌{s} {s}{s}", .{ theme.mocha.lavender, theme.mocha.surface0_bg, theme.mocha.text, text });
         // Fill rest of line with surface0 background
         try stdout.print("\x1b[K{s}\n", .{theme.reset});
     }
 
     fn printThinkingRowWithMargin(self: *App, stdout: anytype, text: []const u8, left_margin: usize) !void {
         try self.writeMargin(stdout, left_margin);
-        try stdout.print("{s}{s}│{s} {s}\x1b[K\n", .{ theme.mocha.mantle_bg, theme.mocha.surface0, theme.mocha.subtext0, text });
+        if (std.mem.startsWith(u8, text, "Thinking:")) {
+            const prefix = "Thinking:";
+            const suffix = text[prefix.len..];
+            try stdout.print("{s}{s} {s}\x1b[3m{s}{s}{s}{s}\x1b[K\n", .{
+                theme.mocha.mantle_bg,
+                theme.mocha.surface0,
+                theme.mocha.mauve,
+                prefix,
+                theme.reset,
+                theme.mocha.subtext0,
+                suffix,
+            });
+        } else {
+            try stdout.print("{s}{s} {s} {s}\x1b[K\n", .{ theme.mocha.mantle_bg, theme.mocha.surface0, theme.mocha.subtext0, text });
+        }
     }
 
     fn printRowWithMargin(_: *App, stdout: anytype, text: []const u8, left_margin: usize) !void {
@@ -1399,6 +1889,60 @@ fn sanitizeAlloc(allocator: std.mem.Allocator, text: []const u8) ![]u8 {
             else => try out.append(allocator, byte),
         }
     }
+    return out.toOwnedSlice(allocator);
+}
+
+fn styleMarkdownLine(allocator: std.mem.Allocator, line: []const u8) ![]u8 {
+    var out = std.ArrayList(u8).empty;
+    errdefer out.deinit(allocator);
+
+    // Heading markers at start: color '#', '##', '###' in orange.
+    var i: usize = 0;
+    var hashes: usize = 0;
+    while (i < line.len and line[i] == '#') : (i += 1) hashes += 1;
+    if (hashes > 0 and hashes <= 3 and i < line.len and line[i] == ' ') {
+        try out.appendSlice(allocator, theme.mocha.peach);
+        try out.appendSlice(allocator, line[0..hashes]);
+        try out.appendSlice(allocator, theme.reset);
+        try out.appendSlice(allocator, theme.mocha.text);
+        try out.append(allocator, ' ');
+        i += 1; // consume the required space after heading marker
+    } else {
+        i = 0;
+    }
+
+    while (i < line.len) {
+        // Inline code: `...` => green
+        if (line[i] == '`') {
+            if (std.mem.indexOfScalarPos(u8, line, i + 1, '`')) |end| {
+                try out.appendSlice(allocator, theme.mocha.green);
+                try out.appendSlice(allocator, line[i .. end + 1]);
+                try out.appendSlice(allocator, theme.reset);
+                try out.appendSlice(allocator, theme.mocha.text);
+                i = end + 1;
+                continue;
+            }
+        }
+
+        // Bold: **...** => bold + purple
+        if (i + 1 < line.len and line[i] == '*' and line[i + 1] == '*') {
+            if (std.mem.indexOfPos(u8, line, i + 2, "**")) |end| {
+                if (end > i + 2) {
+                    try out.appendSlice(allocator, theme.bold);
+                    try out.appendSlice(allocator, theme.mocha.mauve);
+                    try out.appendSlice(allocator, line[i + 2 .. end]);
+                    try out.appendSlice(allocator, theme.reset);
+                    try out.appendSlice(allocator, theme.mocha.text);
+                    i = end + 2;
+                    continue;
+                }
+            }
+        }
+
+        try out.append(allocator, line[i]);
+        i += 1;
+    }
+
     return out.toOwnedSlice(allocator);
 }
 

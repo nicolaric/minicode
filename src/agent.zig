@@ -17,7 +17,7 @@ pub const system_prompt =
     \\  list_files(path) - list directory contents
     \\  run_shell(command) - run non-file shell commands only; requires confirmation
     \\  glob(pattern, path?) - find files by pattern (e.g., "**/*.zig")
-    \\  grep(pattern, path?, include?) - search file contents with line numbers; supports simple a|b alternation, not full regex
+    \\  grep(pattern, path?, include?, case_sensitive?) - search file contents with line numbers; case-insensitive by default; supports basic regex
     \\  edit(path, oldString, newString) - replace text in file and show numbered diff (requires unique match)
     \\All file paths must be relative to the current working directory.
     \\For large files, use offset and limit to read specific line ranges.

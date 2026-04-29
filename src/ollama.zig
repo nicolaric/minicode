@@ -89,7 +89,7 @@ pub fn chatStream(
     messages: []const Message,
     ctx: anytype,
     comptime callback: fn (@TypeOf(ctx), StreamChunk) anyerror!void,
-    comptime shouldCancel: fn (@TypeOf(ctx)) bool,
+    comptime shouldCancel: fn (@TypeOf(ctx)) anyerror!bool,
 ) !void {
     // Build JSON body
     var body_writer = std.Io.Writer.Allocating.init(allocator);
@@ -124,9 +124,12 @@ pub fn chatStream(
 
     var child = try std.process.spawn(std.Options.debug_io, .{
         .argv = &curl_argv,
+        .stdin = .ignore,
         .stdout = .pipe,
     });
-    defer _ = child.wait(std.Options.debug_io) catch {};
+    defer {
+        if (child.id != null) _ = child.wait(std.Options.debug_io) catch {};
+    }
 
     const stdout_file = child.stdout.?;
     const stdout_fd = stdout_file.handle;
@@ -143,7 +146,8 @@ pub fn chatStream(
 
     while (true) {
         // Check cancellation via callback first
-        if (shouldCancel(ctx)) {
+        if (try shouldCancel(ctx)) {
+            child.kill(std.Options.debug_io);
             return error.Cancelled;
         }
 

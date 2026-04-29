@@ -9,6 +9,7 @@ pub const mocha = struct {
     pub const surface0 = "\x1b[38;2;49;50;68m";
     pub const blue = "\x1b[38;2;137;180;250m";
     pub const lavender = "\x1b[38;2;180;190;254m";
+    pub const lavender_bg = "\x1b[48;2;180;190;254m";
     pub const mauve = "\x1b[38;2;203;166;247m";
     pub const peach = "\x1b[38;2;250;179;135m";
     pub const green = "\x1b[38;2;166;227;161m";
