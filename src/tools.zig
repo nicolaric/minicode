@@ -1,5 +1,7 @@
 const std = @import("std");
 const builtin = @import("builtin");
+const ollama = @import("ollama.zig");
+const syntax_highlight = @import("syntax_highlight.zig");
 
 const testing = std.testing;
 
@@ -8,7 +10,12 @@ pub const ToolRequest = struct {
     args: std.json.Value,
 };
 
+pub fn requestFromToolCall(call: ollama.ToolCall) ToolRequest {
+    return .{ .tool = call.name, .args = call.arguments };
+}
+
 const tool_log_file_name = "tool-calls.log";
+const stream_log_file_name = "stream-failures.log";
 const max_logged_tool_output: usize = 64 * 1024;
 
 pub const ConfirmFn = *const fn (ctx: *anyopaque, prompt: []const u8) anyerror!bool;
@@ -32,12 +39,56 @@ pub fn parseToolRequest(allocator: std.mem.Allocator, text: []const u8) !?std.js
 
     if (trimmed[0] != '{') return null;
 
-    const parsed = std.json.parseFromSlice(ToolRequest, allocator, trimmed, .{ .ignore_unknown_fields = true }) catch return null;
+    const parsed = std.json.parseFromSlice(ToolRequest, allocator, trimmed, .{ .ignore_unknown_fields = true }) catch return parseFlatToolRequest(allocator, trimmed);
     if (parsed.value.tool.len == 0) {
         parsed.deinit();
-        return null;
+        return parseFlatToolRequest(allocator, trimmed);
     }
     return parsed;
+}
+
+fn parseFlatToolRequest(allocator: std.mem.Allocator, text: []const u8) !?std.json.Parsed(ToolRequest) {
+    var parsed_value = std.json.parseFromSlice(std.json.Value, allocator, text, .{}) catch return null;
+    defer parsed_value.deinit();
+
+    const object = switch (parsed_value.value) {
+        .object => |object| object,
+        else => return null,
+    };
+
+    const tool_value = object.get("tool") orelse return null;
+    const tool_name = switch (tool_value) {
+        .string => |name| name,
+        else => return null,
+    };
+    if (tool_name.len == 0) return null;
+
+    var out = std.ArrayList(u8).empty;
+    defer out.deinit(allocator);
+    try out.appendSlice(allocator, "{\"tool\":");
+    try appendJsonValue(allocator, &out, tool_name);
+    try out.appendSlice(allocator, ",\"args\":{");
+
+    var first = true;
+    var it = object.iterator();
+    while (it.next()) |entry| {
+        if (std.mem.eql(u8, entry.key_ptr.*, "tool")) continue;
+        if (!first) try out.append(allocator, ',');
+        first = false;
+        try appendJsonValue(allocator, &out, entry.key_ptr.*);
+        try out.append(allocator, ':');
+        try appendJsonValue(allocator, &out, entry.value_ptr.*);
+    }
+
+    try out.appendSlice(allocator, "}}");
+    return std.json.parseFromSlice(ToolRequest, allocator, out.items, .{ .ignore_unknown_fields = true, .allocate = .alloc_always }) catch return null;
+}
+
+fn appendJsonValue(allocator: std.mem.Allocator, out: *std.ArrayList(u8), value: anytype) !void {
+    var json_value = std.Io.Writer.Allocating.init(allocator);
+    defer json_value.deinit();
+    try std.json.Stringify.value(value, .{ .whitespace = .minified }, &json_value.writer);
+    try out.appendSlice(allocator, json_value.written());
 }
 
 fn xmlToolToJson(allocator: std.mem.Allocator, text: []const u8) !?[]u8 {
@@ -98,8 +149,8 @@ fn isKnownTool(tool_name: []const u8) bool {
         std.mem.eql(u8, tool_name, "edit");
 }
 
-pub fn execute(allocator: std.mem.Allocator, req: ToolRequest) ![]u8 {
-    return executeWithConfirm(allocator, req, null);
+pub fn execute(allocator: std.mem.Allocator, req: ToolRequest, highlighter: ?*syntax_highlight.SyntaxHighlighter) ![]u8 {
+    return executeWithConfirm(allocator, req, null, highlighter);
 }
 
 pub fn logToolCall(allocator: std.mem.Allocator, req: ToolRequest, result: []const u8) void {
@@ -113,7 +164,55 @@ pub fn logInvalidToolJson(allocator: std.mem.Allocator, raw_text: []const u8, er
     logToolEvent(allocator, "invalid_tool_json", "parse", raw_text[0..snippet_len], error_message);
 }
 
+pub fn logStreamFailure(
+    allocator: std.mem.Allocator,
+    err_name: []const u8,
+    model: []const u8,
+    base_url: []const u8,
+    had_tool_result: bool,
+    stream_content_len: usize,
+    stream_thinking_len: usize,
+    stream_tool_calls_len: usize,
+) void {
+    const log_dir = toolLogDir(allocator) catch return;
+    defer allocator.free(log_dir);
+    std.Io.Dir.cwd().createDirPath(std.Options.debug_io, log_dir) catch return;
+
+    const log_path = std.fs.path.join(allocator, &.{ log_dir, stream_log_file_name }) catch return;
+    defer allocator.free(log_path);
+
+    var file = std.Io.Dir.openFileAbsolute(std.Options.debug_io, log_path, .{ .mode = .read_write }) catch |open_err| switch (open_err) {
+        error.FileNotFound => std.Io.Dir.createFileAbsolute(std.Options.debug_io, log_path, .{ .read = true, .truncate = false }) catch return,
+        else => return,
+    };
+    defer file.close(std.Options.debug_io);
+
+    var entry = std.ArrayList(u8).empty;
+    defer entry.deinit(allocator);
+    const now_ms = currentTimeMs();
+    entry.print(allocator, "--- stream_failure time_ms={d}\nerror={s}\nmodel={s}\nbase_url={s}\nhad_tool_result={any}\nstream_content_len={d}\nstream_thinking_len={d}\nstream_tool_calls_len={d}\n\n", .{
+        now_ms,
+        err_name,
+        model,
+        base_url,
+        had_tool_result,
+        stream_content_len,
+        stream_thinking_len,
+        stream_tool_calls_len,
+    }) catch return;
+
+    const stat = file.stat(std.Options.debug_io) catch return;
+    file.writePositionalAll(std.Options.debug_io, entry.items, stat.size) catch return;
+}
+
 fn stringifyJsonValue(allocator: std.mem.Allocator, value: std.json.Value) ![]u8 {
+    var json_writer = std.Io.Writer.Allocating.init(allocator);
+    defer json_writer.deinit();
+    try std.json.Stringify.value(value, .{ .whitespace = .minified }, &json_writer.writer);
+    return allocator.dupe(u8, json_writer.written());
+}
+
+fn stringifyJsonString(allocator: std.mem.Allocator, value: []const u8) ![]u8 {
     var json_writer = std.Io.Writer.Allocating.init(allocator);
     defer json_writer.deinit();
     try std.json.Stringify.value(value, .{ .whitespace = .minified }, &json_writer.writer);
@@ -198,7 +297,7 @@ test "write_file creates a file" {
     try args.put(allocator, "path", .{ .string = path });
     try args.put(allocator, "content", .{ .string = "hello\n" });
 
-    const result = try execute(allocator, .{ .tool = "write_file", .args = .{ .object = args } });
+    const result = try execute(allocator, .{ .tool = "write_file", .args = .{ .object = args } }, null);
     try testing.expect(std.mem.indexOf(u8, result, "Created") != null);
 
     const content = try std.Io.Dir.cwd().readFileAlloc(std.Options.debug_io, path, allocator, .limited(1024));
@@ -214,7 +313,7 @@ test "grep searches a single file path" {
     try args.put(allocator, "path", .{ .string = "src/tui.zig" });
     try args.put(allocator, "pattern", .{ .string = "renderPrompt" });
 
-    const result = try execute(allocator, .{ .tool = "grep", .args = .{ .object = args } });
+    const result = try execute(allocator, .{ .tool = "grep", .args = .{ .object = args } }, null);
     try testing.expect(std.mem.indexOf(u8, result, "renderPrompt") != null);
     try testing.expect(std.mem.indexOf(u8, result, "Found") != null);
 }
@@ -241,7 +340,7 @@ test "grep supports regex operators" {
     try args.put(allocator, "path", .{ .string = path });
     try args.put(allocator, "pattern", .{ .string = "^a.+c$" });
 
-    const result = try execute(allocator, .{ .tool = "grep", .args = .{ .object = args } });
+    const result = try execute(allocator, .{ .tool = "grep", .args = .{ .object = args } }, null);
     try testing.expect(std.mem.indexOf(u8, result, "Line: 1") != null);
     try testing.expect(std.mem.indexOf(u8, result, "Line: 2") != null);
     try testing.expect(std.mem.indexOf(u8, result, "Line: 3") != null);
@@ -270,7 +369,7 @@ test "grep supports case_insensitive arg" {
     try args.put(allocator, "pattern", .{ .string = "renderprompt" });
     try args.put(allocator, "case_sensitive", .{ .bool = false });
 
-    const result = try execute(allocator, .{ .tool = "grep", .args = .{ .object = args } });
+    const result = try execute(allocator, .{ .tool = "grep", .args = .{ .object = args } }, null);
     try testing.expect(std.mem.indexOf(u8, result, "Found 1 matches") != null);
 }
 
@@ -282,7 +381,7 @@ test "grep returns ansi error for malformed regex" {
     var args = try std.json.ObjectMap.init(allocator, &.{}, &.{});
     try args.put(allocator, "pattern", .{ .string = "[abc" });
 
-    const result = try execute(allocator, .{ .tool = "grep", .args = .{ .object = args } });
+    const result = try execute(allocator, .{ .tool = "grep", .args = .{ .object = args } }, null);
     try testing.expect(std.mem.indexOf(u8, result, "\x1b[31mError: invalid regex pattern (unclosed character class)\x1b[0m") != null);
 }
 
@@ -294,7 +393,7 @@ test "grep searches current directory by default" {
     var args = try std.json.ObjectMap.init(allocator, &.{}, &.{});
     try args.put(allocator, "pattern", .{ .string = "renderPrompt" });
 
-    const result = try execute(allocator, .{ .tool = "grep", .args = .{ .object = args } });
+    const result = try execute(allocator, .{ .tool = "grep", .args = .{ .object = args } }, null);
     try testing.expect(std.mem.indexOf(u8, result, "renderPrompt") != null);
 }
 
@@ -306,7 +405,7 @@ test "grep finds thinking title in tui by default" {
     var args = try std.json.ObjectMap.init(allocator, &.{}, &.{});
     try args.put(allocator, "pattern", .{ .string = "Thinking" });
 
-    const result = try execute(allocator, .{ .tool = "grep", .args = .{ .object = args } });
+    const result = try execute(allocator, .{ .tool = "grep", .args = .{ .object = args } }, null);
     try testing.expect(std.mem.indexOf(u8, result, "src/tui.zig") != null);
     try testing.expect(std.mem.indexOf(u8, result, "Thinking") != null);
 }
@@ -320,8 +419,70 @@ test "grep include matches relative paths" {
     try args.put(allocator, "pattern", .{ .string = "thinking_marker" });
     try args.put(allocator, "include", .{ .string = "src/*.zig" });
 
-    const result = try execute(allocator, .{ .tool = "grep", .args = .{ .object = args } });
+    const result = try execute(allocator, .{ .tool = "grep", .args = .{ .object = args } }, null);
     try testing.expect(std.mem.indexOf(u8, result, "src/tui.zig") != null);
+}
+
+test "grep next tool call JSON-escapes path" {
+    const path = ".tmp-grep-json-path-\"quote\\slash.txt";
+    std.Io.Dir.cwd().deleteFile(std.Options.debug_io, path) catch |err| switch (err) {
+        error.FileNotFound => {},
+        else => return err,
+    };
+    defer std.Io.Dir.cwd().deleteFile(std.Options.debug_io, path) catch {};
+
+    {
+        var file = try std.Io.Dir.cwd().createFile(std.Options.debug_io, path, .{});
+        defer file.close(std.Options.debug_io);
+        try std.Io.File.writeStreamingAll(file, std.Options.debug_io, "before\nneedle\nafter\n");
+    }
+
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const allocator = arena.allocator();
+
+    var args = try std.json.ObjectMap.init(allocator, &.{}, &.{});
+    try args.put(allocator, "path", .{ .string = path });
+    try args.put(allocator, "pattern", .{ .string = "needle" });
+    try args.put(allocator, "context", .{ .integer = 1 });
+
+    const result = try execute(allocator, .{ .tool = "grep", .args = .{ .object = args } }, null);
+    try testing.expect(std.mem.indexOf(u8, result, "Context lines 1-3:") != null);
+
+    const marker = "Next tool call:\n";
+    const json_start = (std.mem.indexOf(u8, result, marker) orelse return error.TestUnexpectedResult) + marker.len;
+    const json_end = json_start + (std.mem.indexOfScalar(u8, result[json_start..], '\n') orelse return error.TestUnexpectedResult);
+    var parsed = (try parseToolRequest(allocator, result[json_start..json_end])) orelse return error.TestUnexpectedResult;
+    defer parsed.deinit();
+
+    try testing.expectEqualStrings("read_file", parsed.value.tool);
+    try testing.expectEqualStrings(path, getStringArg(parsed.value.args, "path") orelse return error.TestUnexpectedResult);
+}
+
+test "parseToolRequest accepts flat tool arguments" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const allocator = arena.allocator();
+
+    var parsed = (try parseToolRequest(allocator, "{\"tool\":\"grep\",\"pattern\":\"needle\",\"path\":\"src\"}")) orelse return error.TestUnexpectedResult;
+    defer parsed.deinit();
+
+    try testing.expectEqualStrings("grep", parsed.value.tool);
+    try testing.expectEqualStrings("needle", getStringArg(parsed.value.args, "pattern") orelse return error.TestUnexpectedResult);
+    try testing.expectEqualStrings("src", getStringArg(parsed.value.args, "path") orelse return error.TestUnexpectedResult);
+}
+
+test "parseToolRequest keeps nested args behavior" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const allocator = arena.allocator();
+
+    var parsed = (try parseToolRequest(allocator, "{\"tool\":\"grep\",\"args\":{\"pattern\":\"needle\",\"path\":\"src\"}}")) orelse return error.TestUnexpectedResult;
+    defer parsed.deinit();
+
+    try testing.expectEqualStrings("grep", parsed.value.tool);
+    try testing.expectEqualStrings("needle", getStringArg(parsed.value.args, "pattern") orelse return error.TestUnexpectedResult);
+    try testing.expectEqualStrings("src", getStringArg(parsed.value.args, "path") orelse return error.TestUnexpectedResult);
 }
 
 test "glob supports recursive directory pattern" {
@@ -332,7 +493,7 @@ test "glob supports recursive directory pattern" {
     var args = try std.json.ObjectMap.init(allocator, &.{}, &.{});
     try args.put(allocator, "pattern", .{ .string = "src/**/*" });
 
-    const result = try execute(allocator, .{ .tool = "glob", .args = .{ .object = args } });
+    const result = try execute(allocator, .{ .tool = "glob", .args = .{ .object = args } }, null);
     try testing.expect(std.mem.indexOf(u8, result, "src/tui.zig") != null);
 }
 
@@ -354,7 +515,7 @@ test "edit exact replacement still works" {
     defer arena.deinit();
     const allocator = arena.allocator();
 
-    const result = try editFile(allocator, path, "beta", "gamma");
+    const result = try editFile(allocator, path, "beta", "gamma", null);
     try testing.expect(std.mem.indexOf(u8, result, "Edited") != null);
 
     const content = try std.Io.Dir.cwd().readFileAlloc(std.Options.debug_io, path, allocator, .limited(1024));
@@ -379,11 +540,11 @@ test "edit whitespace-tolerant single-line replacement preserves indentation" {
     defer arena.deinit();
     const allocator = arena.allocator();
 
-    const result = try editFile(allocator, path, "\t<title>Old</title>", "  <title>New</title>");
+    const result = try editFile(allocator, path, "\t<title>Old</title>", "  <title>New</title>", null);
     try testing.expect(std.mem.indexOf(u8, result, "Edited") != null);
 
     const content = try std.Io.Dir.cwd().readFileAlloc(std.Options.debug_io, path, allocator, .limited(1024));
-    try testing.expectEqualStrings("<html>\n    <title>New</title>   \n</html>\n", content);
+    try testing.expectEqualStrings("<html>\n    <title>New</title>\n</html>\n", content);
 }
 
 test "edit ambiguous whitespace-tolerant matches return an error" {
@@ -404,18 +565,18 @@ test "edit ambiguous whitespace-tolerant matches return an error" {
     defer arena.deinit();
     const allocator = arena.allocator();
 
-    const result = try editFile(allocator, path, "\t<title>Same</title>", "<title>New</title>");
+    const result = try editFile(allocator, path, "\t<title>Same</title>", "<title>New</title>", null);
     try testing.expect(std.mem.indexOf(u8, result, "ambiguous") != null);
-    try testing.expect(std.mem.indexOf(u8, result, "lines: 1, 2") != null);
 }
 
-pub fn executeWithConfirm(allocator: std.mem.Allocator, req: ToolRequest, confirmer: ?Confirm) ![]u8 {
+pub fn executeWithConfirm(allocator: std.mem.Allocator, req: ToolRequest, confirmer: ?Confirm, highlighter: ?*syntax_highlight.SyntaxHighlighter) ![]u8 {
     if (std.mem.eql(u8, req.tool, "read_file")) return readFile(allocator, getStringArg(req.args, "path") orelse return error.InvalidToolArgs, getUsizeArg(req.args, "offset"), getUsizeArg(req.args, "limit"));
     if (std.mem.eql(u8, req.tool, "write_file")) return writeFile(
         allocator,
         getStringArg(req.args, "path") orelse return error.InvalidToolArgs,
         getStringArg(req.args, "content") orelse return error.InvalidToolArgs,
         confirmer,
+        highlighter,
     );
     if (std.mem.eql(u8, req.tool, "list_files")) return listFiles(allocator, getStringArg(req.args, "path") orelse ".");
     if (std.mem.eql(u8, req.tool, "run_shell")) return runShell(allocator, getStringArg(req.args, "command") orelse return error.InvalidToolArgs, confirmer);
@@ -428,7 +589,7 @@ pub fn executeWithConfirm(allocator: std.mem.Allocator, req: ToolRequest, confir
         getBoolArg(req.args, "case_sensitive") orelse false,
         getUsizeArg(req.args, "context"),
     );
-    if (std.mem.eql(u8, req.tool, "edit")) return editFile(allocator, getStringArg(req.args, "path") orelse return error.InvalidToolArgs, getStringArg(req.args, "oldString") orelse return error.InvalidToolArgs, getStringArg(req.args, "newString") orelse return error.InvalidToolArgs);
+    if (std.mem.eql(u8, req.tool, "edit")) return editFile(allocator, getStringArg(req.args, "path") orelse return error.InvalidToolArgs, getStringArg(req.args, "oldString") orelse return error.InvalidToolArgs, getStringArg(req.args, "newString") orelse return error.InvalidToolArgs, highlighter);
     return std.fmt.allocPrint(allocator, "Error: Unknown tool: {s}", .{req.tool});
 }
 
@@ -462,9 +623,9 @@ fn confirm(prompt: []const u8, confirmer: ?Confirm) !bool {
     if (confirmer) |handler| return handler.callback(handler.ctx, prompt);
 
     var stdout_buf: [8192]u8 = undefined;
-        var stdout_file = std.Io.File.stdout().writerStreaming(std.Options.debug_io, &stdout_buf);
-        const stdout = &stdout_file.interface;
-        defer stdout.flush() catch {};
+    var stdout_file = std.Io.File.stdout().writerStreaming(std.Options.debug_io, &stdout_buf);
+    const stdout = &stdout_file.interface;
+    defer stdout.flush() catch {};
     var stdin_buf: [256]u8 = undefined;
     var stdin_file = std.Io.File.stdin().readerStreaming(std.Options.debug_io, &stdin_buf);
     const stdin = &stdin_file.interface;
@@ -494,7 +655,7 @@ fn hasParentTraversal(path: []const u8) bool {
     return false;
 }
 
-const max_read_lines: usize = 300;
+pub const max_read_lines: usize = 300;
 const max_grep_matches: usize = 20;
 
 /// Read file contents with optional offset and limit
@@ -540,7 +701,7 @@ fn readFile(allocator: std.mem.Allocator, path: []const u8, offset: ?usize, limi
 }
 
 /// Write file with confirmation for existing files
-fn writeFile(allocator: std.mem.Allocator, path: []const u8, content: []const u8, confirmer: ?Confirm) ![]u8 {
+fn writeFile(allocator: std.mem.Allocator, path: []const u8, content: []const u8, confirmer: ?Confirm, highlighter: ?*syntax_highlight.SyntaxHighlighter) ![]u8 {
     const full_path = resolveInsideCwd(allocator, path) catch |err| {
         return switch (err) {
             error.PathOutsideCwd => std.fmt.allocPrint(allocator, "Error: Path must be relative and within current directory", .{}),
@@ -580,7 +741,7 @@ fn writeFile(allocator: std.mem.Allocator, path: []const u8, content: []const u8
     };
 
     if (old_content) |old| {
-        const diff_text = try diffAlloc(allocator, old, content);
+        const diff_text = try diffAlloc(allocator, old, content, path, highlighter);
         defer allocator.free(diff_text);
         return std.fmt.allocPrint(allocator, "Updated {s}\n{s}", .{ path, diff_text });
     } else {
@@ -936,11 +1097,12 @@ fn grepRecursive(allocator: std.mem.Allocator, dir_path: []const u8, pattern: []
 
 fn isBinaryFile(filename: []const u8) bool {
     const binary_exts = [_][]const u8{
-        ".exe", ".dll", ".so", ".dylib", ".bin",
-        ".png", ".jpg", ".jpeg", ".gif", ".bmp", ".ico",
-        ".mp3", ".mp4", ".avi", ".mov", ".wav",
-        ".zip", ".tar", ".gz", ".bz2", ".7z", ".rar",
-        ".o", ".obj", ".a", ".lib", ".pdb",
+        ".exe", ".dll", ".so",   ".dylib", ".bin",
+        ".png", ".jpg", ".jpeg", ".gif",   ".bmp",
+        ".ico", ".mp3", ".mp4",  ".avi",   ".mov",
+        ".wav", ".zip", ".tar",  ".gz",    ".bz2",
+        ".7z",  ".rar", ".o",    ".obj",   ".a",
+        ".lib", ".pdb",
     };
     const lower = std.fs.path.extension(filename);
     for (binary_exts) |ext| {
@@ -957,6 +1119,8 @@ fn searchInFile(allocator: std.mem.Allocator, file_path: []const u8, pattern: []
 
     const display_path = try relativeDisplayPath(allocator, file_path);
     defer allocator.free(display_path);
+    const display_path_json = try stringifyJsonString(allocator, display_path);
+    defer allocator.free(display_path_json);
 
     var lines = std.ArrayList([]const u8).empty;
     defer lines.deinit(allocator);
@@ -993,13 +1157,12 @@ fn searchInFile(allocator: std.mem.Allocator, file_path: []const u8, pattern: []
                 const display_context_line = if (context_line.len > 200) context_line[0..200] else context_line;
                 try results.print(allocator, "{c} {d}: {s}\n", .{ prefix, current, display_context_line });
             }
-        } else {
-            try results.print(allocator,
-                \\Next tool call:
-                \\{{"tool":"read_file","args":{{"path":"{s}","offset":{d},"limit":300}}}}
-                \\
-            , .{ display_path, line_num });
         }
+        try results.print(allocator,
+            \\Next tool call:
+            \\{{"tool":"read_file","args":{{"path":{s},"offset":{d},"limit":300}}}}
+            \\
+        , .{ display_path_json, line_num });
         try results.append(allocator, '\n');
         match_count.* += 1;
     }
@@ -1220,7 +1383,7 @@ fn relativeDisplayPath(allocator: std.mem.Allocator, file_path: []const u8) ![]u
 }
 
 /// Edit a file by replacing oldString with newString
-fn editFile(allocator: std.mem.Allocator, path: []const u8, old_string: []const u8, new_string: []const u8) ![]u8 {
+fn editFile(allocator: std.mem.Allocator, path: []const u8, old_string: []const u8, new_string: []const u8, highlighter: ?*syntax_highlight.SyntaxHighlighter) ![]u8 {
     const full_path = resolveInsideCwd(allocator, path) catch |err| {
         return switch (err) {
             error.PathOutsideCwd => std.fmt.allocPrint(allocator, "Error: Path must be relative and within current directory", .{}),
@@ -1253,7 +1416,7 @@ fn editFile(allocator: std.mem.Allocator, path: []const u8, old_string: []const 
         return std.fmt.allocPrint(allocator, "Error writing file: {s}", .{@errorName(err)});
     };
 
-    const diff_text = try diffAlloc(allocator, content, new_content);
+    const diff_text = try diffAlloc(allocator, content, new_content, path, highlighter);
     defer allocator.free(diff_text);
     return std.fmt.allocPrint(allocator, "Edited {s}\n{s}", .{ path, diff_text });
 }
@@ -1282,14 +1445,12 @@ fn whitespaceTolerantSingleLineEdit(allocator: std.mem.Allocator, path: []const 
     const match = matches.items[0];
     const trimmed_line = std.mem.trim(u8, match.text, " \t\r\n");
     const trim_start = @intFromPtr(trimmed_line.ptr) - @intFromPtr(match.text.ptr);
-    const trim_end = trim_start + trimmed_line.len;
 
     var result = std.ArrayList(u8).empty;
     errdefer result.deinit(allocator);
     try result.appendSlice(allocator, content[0..match.start]);
     try result.appendSlice(allocator, match.text[0..trim_start]);
     try result.appendSlice(allocator, trimmed_new);
-    try result.appendSlice(allocator, match.text[trim_end..]);
     try result.appendSlice(allocator, match.newline);
     try result.appendSlice(allocator, content[match.end..]);
     return result.toOwnedSlice(allocator);
@@ -1398,7 +1559,9 @@ fn containsIgnoreCase(haystack: []const u8, needle: []const u8) bool {
 }
 
 /// Compute a side-by-side diff between old and new content
-fn diffAlloc(allocator: std.mem.Allocator, old_content: []const u8, new_content: []const u8) ![]u8 {
+fn diffAlloc(allocator: std.mem.Allocator, old_content: []const u8, new_content: []const u8, path: []const u8, highlighter: ?*syntax_highlight.SyntaxHighlighter) ![]u8 {
+    _ = path;
+    _ = highlighter;
     var old_lines = std.ArrayList([]const u8).empty;
     defer old_lines.deinit(allocator);
     var it = std.mem.splitScalar(u8, old_content, '\n');
@@ -1415,8 +1578,8 @@ fn diffAlloc(allocator: std.mem.Allocator, old_content: []const u8, new_content:
     const LineDiff = struct {
         old_line: ?usize,
         new_line: ?usize,
-        old_text: ?[]const u8,
-        new_text: ?[]const u8,
+        old_idx: ?usize,
+        new_idx: ?usize,
     };
 
     var diff_lines = std.ArrayList(LineDiff).empty;
@@ -1438,28 +1601,28 @@ fn diffAlloc(allocator: std.mem.Allocator, old_content: []const u8, new_content:
             try diff_lines.append(allocator, .{
                 .old_line = old_idx + 1,
                 .new_line = new_idx + 1,
-                .old_text = old_lines.items[old_idx],
-                .new_text = new_lines.items[new_idx],
+                .old_idx = old_idx,
+                .new_idx = new_idx,
             });
             old_idx += 1;
             new_idx += 1;
             lcs_idx += 1;
         } else if (lcs_idx < lcs.len and old_idx < old_lines.items.len and std.mem.eql(u8, old_lines.items[old_idx], lcs[lcs_idx])) {
-            // Line removed
+            // Line added in new
             try diff_lines.append(allocator, .{
                 .old_line = null,
                 .new_line = new_idx + 1,
-                .old_text = null,
-                .new_text = new_lines.items[new_idx],
+                .old_idx = null,
+                .new_idx = new_idx,
             });
             new_idx += 1;
         } else if (lcs_idx < lcs.len and new_idx < new_lines.items.len and std.mem.eql(u8, new_lines.items[new_idx], lcs[lcs_idx])) {
-            // Line removed
+            // Line removed from old
             try diff_lines.append(allocator, .{
                 .old_line = old_idx + 1,
                 .new_line = null,
-                .old_text = old_lines.items[old_idx],
-                .new_text = null,
+                .old_idx = old_idx,
+                .new_idx = null,
             });
             old_idx += 1;
         } else if (old_idx < old_lines.items.len and new_idx < new_lines.items.len) {
@@ -1467,8 +1630,8 @@ fn diffAlloc(allocator: std.mem.Allocator, old_content: []const u8, new_content:
             try diff_lines.append(allocator, .{
                 .old_line = old_idx + 1,
                 .new_line = new_idx + 1,
-                .old_text = old_lines.items[old_idx],
-                .new_text = new_lines.items[new_idx],
+                .old_idx = old_idx,
+                .new_idx = new_idx,
             });
             old_idx += 1;
             new_idx += 1;
@@ -1477,8 +1640,8 @@ fn diffAlloc(allocator: std.mem.Allocator, old_content: []const u8, new_content:
             try diff_lines.append(allocator, .{
                 .old_line = old_idx + 1,
                 .new_line = null,
-                .old_text = old_lines.items[old_idx],
-                .new_text = null,
+                .old_idx = old_idx,
+                .new_idx = null,
             });
             old_idx += 1;
         } else if (new_idx < new_lines.items.len) {
@@ -1486,8 +1649,8 @@ fn diffAlloc(allocator: std.mem.Allocator, old_content: []const u8, new_content:
             try diff_lines.append(allocator, .{
                 .old_line = null,
                 .new_line = new_idx + 1,
-                .old_text = null,
-                .new_text = new_lines.items[new_idx],
+                .old_idx = null,
+                .new_idx = new_idx,
             });
             new_idx += 1;
         }
@@ -1498,39 +1661,54 @@ fn diffAlloc(allocator: std.mem.Allocator, old_content: []const u8, new_content:
     }
 
     // ANSI color codes
-    const red_bg = "\x1b[48;2;69;40;48m";      // Dark red background (like in screenshot)
-    const green_bg = "\x1b[48;2;40;69;48m";    // Dark green background (like in screenshot)
-    const dim_text = "\x1b[38;5;245m";         // Dim gray for context lines
-    const normal_text = "\x1b[0m";             // Reset
+    const red_bg = "\x1b[48;2;69;40;48m"; // Dark red background (like in screenshot)
+    const green_bg = "\x1b[48;2;40;69;48m"; // Dark green background (like in screenshot)
+    const dim_text = "\x1b[38;5;245m"; // Dim gray for context lines
+    const normal_text = "\x1b[0m"; // Reset
+
+    // Fixed column positions for alignment
+    const left_content_width = 45; // Max width for left side content
 
     // Render side-by-side diff
     for (diff_lines.items) |dl| {
-        const is_change = if (dl.old_text != null and dl.new_text != null)
-            !std.mem.eql(u8, dl.old_text.?, dl.new_text.?)
-        else
-            true;
+        const is_change = dl.old_line == null or dl.new_line == null or
+            (dl.old_idx != null and dl.new_idx != null and
+                !std.mem.eql(u8, old_lines.items[dl.old_idx.?], new_lines.items[dl.new_idx.?]));
 
-        // Old side (left)
+        // Old side (left) - line number (4) + 2 spaces = 6 chars, content truncated to left_content_width
         if (dl.old_line) |ln| {
-            if (is_change) {
-                try result.print(allocator, "{s}{d: >4}  {s}{s}", .{ red_bg, ln, dl.old_text.?, normal_text });
+            const color = if (is_change) red_bg else dim_text;
+
+            // Use plain text for diff (syntax highlighting is complex with diff backgrounds)
+            const plain_text = old_lines.items[dl.old_idx.?];
+
+            if (plain_text.len > left_content_width) {
+                try result.print(allocator, "{s}{d: >4}  {s}…{s}", .{ color, ln, plain_text[0..left_content_width], normal_text });
             } else {
-                try result.print(allocator, "{s}{d: >4}  {s}{s}", .{ dim_text, ln, dl.old_text.?, normal_text });
+                const padding = left_content_width - plain_text.len;
+                try result.print(allocator, "{s}{d: >4}  {s}", .{ color, ln, plain_text });
+                try result.appendNTimes(allocator, ' ', padding);
+                try result.appendSlice(allocator, normal_text);
             }
         } else {
-            // Empty on old side
-            try result.print(allocator, "{s: >4}  {s}", .{ " ", normal_text });
+            // Empty on old side - fill with spaces to maintain alignment
+            try result.appendNTimes(allocator, ' ', 6 + left_content_width);
         }
 
         // Gap between sides
         try result.appendSlice(allocator, "    ");
 
-        // New side (right)
+        // New side (right) - always starts at same column
         if (dl.new_line) |ln| {
-            if (is_change) {
-                try result.print(allocator, "{s}{d: >4}  {s}{s}\n", .{ green_bg, ln, dl.new_text.?, normal_text });
+            const color = if (is_change) green_bg else dim_text;
+
+            // Use plain text for diff (syntax highlighting is complex with diff backgrounds)
+            const plain_text = new_lines.items[dl.new_idx.?];
+
+            if (plain_text.len > left_content_width) {
+                try result.print(allocator, "{s}{d: >4}  {s}…{s}\n", .{ color, ln, plain_text[0..left_content_width], normal_text });
             } else {
-                try result.print(allocator, "{s}{d: >4}  {s}{s}\n", .{ dim_text, ln, dl.new_text.?, normal_text });
+                try result.print(allocator, "{s}{d: >4}  {s}{s}\n", .{ color, ln, plain_text, normal_text });
             }
         } else {
             // Empty on new side

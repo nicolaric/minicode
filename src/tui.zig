@@ -13,6 +13,16 @@ const max_input = 16 * 1024;
 
 const minicode_banner = "";
 
+const GrepMatch = struct {
+    path: []u8,
+    line: usize,
+};
+
+const ReadContinuation = struct {
+    path: []u8,
+    offset: usize,
+};
+
 const welcome_title_lines = [_][]const u8{
     "███    ███ ██ ███    ██ ██  ██████  ██████  ██████  ███████ ",
     "████  ████ ██ ████   ██ ██ ██      ██    ██ ██   ██ ██      ",
@@ -37,9 +47,12 @@ const App = struct {
     // Streaming accumulation
     stream_content: std.ArrayList(u8),
     stream_thinking: std.ArrayList(u8),
+    stream_tool_calls: std.ArrayList(ollama.ToolCall),
     stream_lines_start: usize,
     thinking_started: bool,
     read_requests: std.ArrayList([]u8),
+    grep_matches: std.ArrayList(GrepMatch),
+    read_continuations: std.ArrayList(ReadContinuation),
     // Syntax highlighter
     highlighter: ?*syntax_highlight.SyntaxHighlighter,
     // Welcome screen state
@@ -62,24 +75,39 @@ const App = struct {
             .cancel_requested = false,
             .stream_content = .empty,
             .stream_thinking = .empty,
+            .stream_tool_calls = .empty,
             .stream_lines_start = 0,
             .thinking_started = false,
             .read_requests = .empty,
+            .grep_matches = .empty,
+            .read_continuations = .empty,
             .highlighter = highlighter,
             .show_welcome = true,
         };
     }
 
     fn deinit(self: *App) void {
-        for (self.messages.items) |message| self.allocator.free(message.content);
+        for (self.messages.items) |message| {
+            self.allocator.free(message.content);
+            if (message.thinking) |thinking| self.allocator.free(thinking);
+            if (message.tool_calls) |tool_calls| ollama.freeToolCalls(self.allocator, tool_calls);
+            if (message.tool_name) |tool_name| self.allocator.free(tool_name);
+            if (message.tool_call_id) |tool_call_id| self.allocator.free(tool_call_id);
+        }
         self.messages.deinit(self.allocator);
         for (self.lines.items) |line| self.allocator.free(line);
         self.lines.deinit(self.allocator);
         self.input.deinit(self.allocator);
         self.stream_content.deinit(self.allocator);
         self.stream_thinking.deinit(self.allocator);
+        self.clearStreamToolCalls();
+        self.stream_tool_calls.deinit(self.allocator);
         self.clearReadRequests();
         self.read_requests.deinit(self.allocator);
+        self.clearGrepMatches();
+        self.grep_matches.deinit(self.allocator);
+        self.clearReadContinuations();
+        self.read_continuations.deinit(self.allocator);
         if (self.highlighter) |h| h.destroy();
     }
 
@@ -366,7 +394,11 @@ const App = struct {
     fn completeTurn(self: *App, initial_stream_start: usize) !void {
         var stream_start = initial_stream_start;
         var thinking_only_retries: usize = 0;
+        var post_tool_empty_retry_used = false;
+        var had_tool_result = false;
         self.clearReadRequests();
+        self.clearGrepMatches();
+        self.clearReadContinuations();
 
         // Add spacing between user message and response
         try self.addLine("", .{});
@@ -375,6 +407,7 @@ const App = struct {
         while (true) {
             self.stream_content.clearRetainingCapacity();
             self.stream_thinking.clearRetainingCapacity();
+            self.clearStreamToolCalls();
             self.thinking_started = false;
             self.cancel_requested = false;
             self.stream_lines_start = stream_start;
@@ -382,9 +415,17 @@ const App = struct {
             ollama.chatStream(self.allocator, self.cfg, self.messages.items, self, streamingCallback, shouldCancelCallback) catch |err| {
                 if (err == error.Cancelled) {
                     // Add partial response if any content was received
-                    if (self.stream_content.items.len > 0) {
+                    if (self.stream_content.items.len > 0 or self.stream_thinking.items.len > 0 or self.stream_tool_calls.items.len > 0) {
                         const partial_content = try self.allocator.dupe(u8, self.stream_content.items);
-                        try self.messages.append(self.allocator, .{ .role = .assistant, .content = partial_content });
+                        const partial_thinking = if (self.stream_thinking.items.len > 0)
+                            try self.allocator.dupe(u8, self.stream_thinking.items)
+                        else
+                            null;
+                        const partial_tool_calls = if (self.stream_tool_calls.items.len > 0)
+                            try ollama.cloneToolCalls(self.allocator, self.stream_tool_calls.items)
+                        else
+                            null;
+                        try self.messages.append(self.allocator, .{ .role = .assistant, .content = partial_content, .thinking = partial_thinking, .tool_calls = partial_tool_calls });
                         try self.addAssistantBlock(partial_content);
                         try self.addLine("", .{});
                         try self.addLine("(response cancelled)", .{});
@@ -393,22 +434,54 @@ const App = struct {
                     }
                     return;
                 }
-                return err;
+
+                tools.logStreamFailure(
+                    self.allocator,
+                    @errorName(err),
+                    self.cfg.model,
+                    self.cfg.base_url,
+                    had_tool_result,
+                    self.stream_content.items.len,
+                    self.stream_thinking.items.len,
+                    self.stream_tool_calls.items.len,
+                );
+
+                if (had_tool_result and !post_tool_empty_retry_used) {
+                    post_tool_empty_retry_used = true;
+                    const recovery = try std.fmt.allocPrint(self.allocator, "Tool result received, but stream failed ({s}). Continue the task from the latest tool result. If you need another tool, output only valid tool JSON.", .{@errorName(err)});
+                    try self.messages.append(self.allocator, .{ .role = .user, .content = recovery });
+                    stream_start = self.lines.items.len;
+                    continue;
+                }
+
+                try self.addLine("(stream error: {s})", .{@errorName(err)});
+                return;
             };
 
             self.cancel_requested = false;
 
-            if (self.stream_content.items.len == 0 and self.stream_thinking.items.len == 0) {
+            if (self.stream_content.items.len == 0 and self.stream_thinking.items.len == 0 and self.stream_tool_calls.items.len == 0) {
+                if (had_tool_result and !post_tool_empty_retry_used) {
+                    post_tool_empty_retry_used = true;
+                    const recovery = try self.allocator.dupe(u8, "Tool result received. Continue the task. If no matches were found, broaden the search and proceed.");
+                    try self.messages.append(self.allocator, .{ .role = .user, .content = recovery });
+                    stream_start = self.lines.items.len;
+                    continue;
+                }
                 try self.addLine("(no response)", .{});
                 return;
             }
-            
-            if (self.stream_content.items.len == 0 and self.stream_thinking.items.len > 0) {
+             
+            if (self.stream_content.items.len == 0 and self.stream_thinking.items.len > 0 and self.stream_tool_calls.items.len == 0) {
                 if (thinking_only_retries >= 2) {
                     try self.addLine("(no response)", .{});
                     return;
                 }
                 thinking_only_retries += 1;
+
+                const thinking_only_content = try self.allocator.dupe(u8, "");
+                const thinking_only_thinking = try self.allocator.dupe(u8, self.stream_thinking.items);
+                try self.messages.append(self.allocator, .{ .role = .assistant, .content = thinking_only_content, .thinking = thinking_only_thinking });
 
                 const continue_message = try self.allocator.dupe(u8, "Continue. If you need a tool, output only the tool JSON. Otherwise answer normally.");
                 try self.messages.append(self.allocator, .{ .role = .user, .content = continue_message });
@@ -417,8 +490,72 @@ const App = struct {
             }
 
             const final_content = try self.allocator.dupe(u8, self.stream_content.items);
+            const final_thinking = if (self.stream_thinking.items.len > 0)
+                try self.allocator.dupe(u8, self.stream_thinking.items)
+            else
+                null;
 
-            try self.messages.append(self.allocator, .{ .role = .assistant, .content = final_content });
+            const final_tool_calls = if (self.stream_tool_calls.items.len > 0)
+                try ollama.cloneToolCalls(self.allocator, self.stream_tool_calls.items)
+            else
+                null;
+
+            try self.messages.append(self.allocator, .{ .role = .assistant, .content = final_content, .thinking = final_thinking, .tool_calls = final_tool_calls });
+
+            if (self.stream_tool_calls.items.len > 0) {
+                for (self.stream_tool_calls.items) |call| {
+                    const request = tools.requestFromToolCall(call);
+                    const safe_tool = try sanitizeAlloc(self.allocator, request.tool);
+                    defer self.allocator.free(safe_tool);
+
+                    const pending_summary = try self.formatToolDisplay(safe_tool, request.args);
+                    defer self.allocator.free(pending_summary);
+                    try self.addLine("", .{});
+                    try self.addLine("{s}", .{pending_summary});
+                    try self.render();
+
+                    var tool_failed = false;
+                    const result = if (try self.repeatedReadError(request)) |read_error| blk: {
+                        tool_failed = true;
+                        break :blk read_error;
+                    } else tools.executeWithConfirm(self.allocator, request, .{
+                        .ctx = self,
+                        .callback = confirmCallback,
+                    }, self.highlighter) catch |err| blk: {
+                        tool_failed = true;
+                        break :blk try std.fmt.allocPrint(self.allocator, "Tool error: {s}", .{@errorName(err)});
+                    };
+                    defer self.allocator.free(result);
+                    tools.logToolCall(self.allocator, request, result);
+                    try self.recordGrepResults(request, result);
+                    if (std.mem.startsWith(u8, result, "Error:") or std.mem.startsWith(u8, result, "Tool error:")) {
+                        tool_failed = true;
+                    }
+
+                    const summary = try self.formatToolResultSummary(safe_tool, request.args, result);
+                    defer self.allocator.free(summary);
+                    self.removeLineAt(self.lines.items.len - 1);
+                    try self.addLine("{s}", .{summary});
+                    if (tool_failed) try self.addToolError(result);
+                    if (std.mem.eql(u8, safe_tool, "edit") or std.mem.eql(u8, safe_tool, "write_file")) {
+                        try self.addToolResultDetails(result);
+                    }
+                    try self.addLine("", .{});
+
+                    const tool_message = try std.fmt.allocPrint(self.allocator, "Result from tool `{s}`. Use this result to continue; do not repeat the same tool call unless you need a different offset, limit, path, or pattern.\n{s}", .{ request.tool, result });
+                    errdefer self.allocator.free(tool_message);
+                    try self.messages.append(self.allocator, .{
+                        .role = .tool,
+                        .content = tool_message,
+                        .tool_name = try self.allocator.dupe(u8, request.tool),
+                        .tool_call_id = if (call.id) |id| try self.allocator.dupe(u8, id) else null,
+                    });
+                    had_tool_result = true;
+                    try self.render();
+                }
+                stream_start = self.lines.items.len;
+                continue;
+            }
 
             // Check for tool request - handle case where there's text before the JSON
             var maybe_tool: ?std.json.Parsed(tools.ToolRequest) = null;
@@ -461,12 +598,13 @@ const App = struct {
                 } else tools.executeWithConfirm(self.allocator, parsed.value, .{
                     .ctx = self,
                     .callback = confirmCallback,
-                }) catch |err| blk: {
+                }, self.highlighter) catch |err| blk: {
                     tool_failed = true;
                     break :blk try std.fmt.allocPrint(self.allocator, "Tool error: {s}", .{@errorName(err)});
                 };
                 defer self.allocator.free(result);
                 tools.logToolCall(self.allocator, parsed.value, result);
+                try self.recordGrepResults(parsed.value, result);
                 if (std.mem.startsWith(u8, result, "Error:") or std.mem.startsWith(u8, result, "Tool error:")) {
                     tool_failed = true;
                 }
@@ -487,6 +625,7 @@ const App = struct {
                 // Send full result to agent
                 const tool_message = try std.fmt.allocPrint(self.allocator, "Result from tool `{s}`. Use this result to continue; do not repeat the same tool call unless you need a different offset, limit, path, or pattern.\n{s}", .{ parsed.value.tool, result });
                 try self.messages.append(self.allocator, .{ .role = .user, .content = tool_message });
+                had_tool_result = true;
                 try self.render();
                 // Update stream_start so next iteration doesn't clear previous content
                 stream_start = self.lines.items.len;
@@ -665,6 +804,21 @@ const App = struct {
         self.read_requests.clearRetainingCapacity();
     }
 
+    fn clearStreamToolCalls(self: *App) void {
+        for (self.stream_tool_calls.items) |call| ollama.freeToolCall(self.allocator, call);
+        self.stream_tool_calls.clearRetainingCapacity();
+    }
+
+    fn clearGrepMatches(self: *App) void {
+        for (self.grep_matches.items) |match| self.allocator.free(match.path);
+        self.grep_matches.clearRetainingCapacity();
+    }
+
+    fn clearReadContinuations(self: *App) void {
+        for (self.read_continuations.items) |continuation| self.allocator.free(continuation.path);
+        self.read_continuations.clearRetainingCapacity();
+    }
+
     fn repeatedReadError(self: *App, request: tools.ToolRequest) !?[]u8 {
         if (!std.mem.eql(u8, request.tool, "read_file")) return null;
         if (request.args != .object) return null;
@@ -673,10 +827,16 @@ const App = struct {
         if (path_value != .string) return null;
         const path = path_value.string;
 
-        var offset: usize = 1;
-        if (request.args.object.get("offset")) |offset_value| {
-            if (offset_value == .integer and offset_value.integer > 0) {
-                offset = @intCast(offset_value.integer);
+        const offset = readUsizeArg(request.args, "offset") orelse 1;
+        const line_limit = @min(readUsizeArg(request.args, "limit") orelse tools.max_read_lines, tools.max_read_lines);
+
+        if (!self.isReadContinuation(path, offset)) {
+            if (self.truncatedGrepOffset(path, offset)) |full_offset| {
+                return try std.fmt.allocPrint(
+                    self.allocator,
+                    "Error: read_file offset={d} looks like a shortened/truncated form of the recent grep match at {s}:{d}. Call read_file with the exact full offset={d}; do not drop leading digits, shorten, or round grep line numbers.",
+                    .{ offset, path, full_offset, full_offset },
+                );
             }
         }
 
@@ -688,18 +848,92 @@ const App = struct {
                 return try std.fmt.allocPrint(
                     self.allocator,
                     "Error: Already read {s} at offset={d} in this turn. If grep showed a line like 1680, use offset=1680 EXACTLY; do not shorten it to 168/160/180. Otherwise continue after this range with offset={d}.",
-                    .{ path, offset, offset + 100 },
+                    .{ path, offset, offset + line_limit },
                 );
             }
         }
         try self.read_requests.append(self.allocator, key);
+        try self.recordReadContinuation(path, offset + line_limit);
         return null;
+    }
+
+    fn recordGrepResults(self: *App, request: tools.ToolRequest, result: []const u8) !void {
+        if (!std.mem.eql(u8, request.tool, "grep")) return;
+        if (std.mem.startsWith(u8, result, "Error:") or std.mem.startsWith(u8, result, "Tool error:")) return;
+
+        var current_path: ?[]const u8 = null;
+        var it = std.mem.splitScalar(u8, result, '\n');
+        while (it.next()) |line| {
+            if (std.mem.startsWith(u8, line, "File: ")) {
+                current_path = line[6..];
+            } else if (std.mem.startsWith(u8, line, "Line: ")) {
+                const path = current_path orelse continue;
+                const line_num = std.fmt.parseUnsigned(usize, std.mem.trim(u8, line[6..], " \t\r"), 10) catch continue;
+                const match_path = try self.allocator.dupe(u8, path);
+                errdefer self.allocator.free(match_path);
+                try self.grep_matches.append(self.allocator, .{ .path = match_path, .line = line_num });
+            }
+        }
+    }
+
+    fn truncatedGrepOffset(self: *App, path: []const u8, offset: usize) ?usize {
+        if (offset < 10) return null;
+        for (self.grep_matches.items) |match| {
+            if (!sameToolPath(match.path, path)) continue;
+            if (offset >= match.line or offset == match.line) continue;
+            if (isShortenedOffset(offset, match.line)) return match.line;
+        }
+        return null;
+    }
+
+    fn isShortenedOffset(offset: usize, full_offset: usize) bool {
+        var divisor: usize = 10;
+        var tmp = offset;
+        while (tmp >= 10) : (tmp /= 10) divisor *= 10;
+        if (full_offset % divisor == offset) return true;
+        return offset >= 100 and full_offset % 100 == offset % 100;
+    }
+
+    fn isReadContinuation(self: *App, path: []const u8, offset: usize) bool {
+        for (self.read_continuations.items) |continuation| {
+            if (continuation.offset == offset and sameToolPath(continuation.path, path)) return true;
+        }
+        return false;
+    }
+
+    fn sameToolPath(a: []const u8, b: []const u8) bool {
+        return std.mem.eql(u8, trimCurrentDirPrefix(a), trimCurrentDirPrefix(b));
+    }
+
+    fn trimCurrentDirPrefix(path: []const u8) []const u8 {
+        var trimmed = path;
+        while (std.mem.startsWith(u8, trimmed, "./")) trimmed = trimmed[2..];
+        return trimmed;
+    }
+
+    fn recordReadContinuation(self: *App, path: []const u8, offset: usize) !void {
+        if (self.isReadContinuation(path, offset)) return;
+        const continuation_path = try self.allocator.dupe(u8, path);
+        errdefer self.allocator.free(continuation_path);
+        try self.read_continuations.append(self.allocator, .{ .path = continuation_path, .offset = offset });
+    }
+
+    fn readUsizeArg(args: std.json.Value, name: []const u8) ?usize {
+        if (args != .object) return null;
+        const value = args.object.get(name) orelse return null;
+        return switch (value) {
+            .integer => |i| if (i >= 0) @intCast(i) else null,
+            .string => |s| std.fmt.parseUnsigned(usize, s, 10) catch null,
+            else => null,
+        };
     }
 
     fn addToolResultDetails(self: *App, result: []const u8) !void {
         var it = std.mem.splitScalar(u8, result, '\n');
         while (it.next()) |line| {
-            const safe_line = try sanitizeAlloc(self.allocator, line);
+            // Diff output already contains ANSI color codes - don't sanitize them
+            // Just ensure no harmful control characters
+            const safe_line = try sanitizeAnsiAlloc(self.allocator, line);
             defer self.allocator.free(safe_line);
             try self.addLine("  {s}", .{safe_line});
         }
@@ -721,10 +955,12 @@ const App = struct {
         }
 
         if (chunk.content_delta.len > 0) {
+            const delta = chunk.content_delta;
+
             // Deduplication: check if this is truly new content
             // Some models send full content instead of deltas
             const existing = self.stream_content.items;
-            const new_content = chunk.content_delta;
+            const new_content = delta;
             if (existing.len == 0) {
                 // First chunk - append all
                 try self.stream_content.appendSlice(self.allocator, new_content);
@@ -744,7 +980,15 @@ const App = struct {
             try self.stream_thinking.appendSlice(self.allocator, td);
         }
 
-        if (chunk.content_delta.len > 0 or (chunk.thinking_delta != null and chunk.thinking_delta.?.len > 0)) {
+        if (chunk.tool_calls) |calls| {
+            var owned_calls: ?[]ollama.ToolCall = calls;
+            errdefer if (owned_calls) |pending_calls| ollama.freeToolCalls(self.allocator, pending_calls);
+            try self.stream_tool_calls.appendSlice(self.allocator, calls);
+            owned_calls = null;
+            self.allocator.free(calls);
+        }
+
+        if (chunk.content_delta.len > 0 or (chunk.thinking_delta != null and chunk.thinking_delta.?.len > 0) or chunk.tool_calls != null) {
             try self.refreshStreamingLines();
             // Auto-scroll to bottom during streaming to show latest content
             self.scroll_offset = self.getMaxScroll();
@@ -1829,17 +2073,17 @@ const App = struct {
         if (std.mem.startsWith(u8, text, "Thinking:")) {
             const prefix = "Thinking:";
             const suffix = text[prefix.len..];
-            try stdout.print("{s}{s} {s}\x1b[3m{s}{s}{s}{s}\x1b[K\n", .{
+            try stdout.print("{s}{s} {s}\x1b[3m{s}\x1b[23m{s}{s}\x1b[K{s}\n", .{
                 theme.mocha.mantle_bg,
                 theme.mocha.surface0,
                 theme.mocha.mauve,
                 prefix,
-                theme.reset,
                 theme.mocha.subtext0,
                 suffix,
+                theme.reset,
             });
         } else {
-            try stdout.print("{s}{s} {s} {s}\x1b[K\n", .{ theme.mocha.mantle_bg, theme.mocha.surface0, theme.mocha.subtext0, text });
+            try stdout.print("{s}{s} {s} {s}\x1b[K{s}\n", .{ theme.mocha.mantle_bg, theme.mocha.surface0, theme.mocha.subtext0, text, theme.reset });
         }
     }
 
@@ -1890,6 +2134,35 @@ fn sanitizeAlloc(allocator: std.mem.Allocator, text: []const u8) ![]u8 {
             9 => try out.append(allocator, ' '),
             else => try out.append(allocator, byte),
         }
+    }
+    return out.toOwnedSlice(allocator);
+}
+
+/// Sanitize text while preserving ANSI escape sequences (for diff output)
+fn sanitizeAnsiAlloc(allocator: std.mem.Allocator, text: []const u8) ![]u8 {
+    var out = std.ArrayList(u8).empty;
+    errdefer out.deinit(allocator);
+    var i: usize = 0;
+    while (i < text.len) {
+        const byte = text[i];
+        // Check for ANSI escape sequence: ESC [ ... m
+        if (byte == '\x1b' and i + 1 < text.len and text[i + 1] == '[') {
+            // Find the end of the ANSI sequence (ends with a letter)
+            var j = i + 2;
+            while (j < text.len and !std.ascii.isAlphabetic(text[j])) : (j += 1) {}
+            if (j < text.len) {
+                // Include the complete ANSI sequence
+                try out.appendSlice(allocator, text[i .. j + 1]);
+                i = j + 1;
+                continue;
+            }
+        }
+        switch (byte) {
+            0...8, 11...31, 127...159 => try out.append(allocator, '?'),
+            9 => try out.append(allocator, ' '),
+            else => try out.append(allocator, byte),
+        }
+        i += 1;
     }
     return out.toOwnedSlice(allocator);
 }
