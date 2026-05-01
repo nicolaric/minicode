@@ -497,6 +497,69 @@ test "glob supports recursive directory pattern" {
     try testing.expect(std.mem.indexOf(u8, result, "src/tui.zig") != null);
 }
 
+test "glob excludes .gitignore matches" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const allocator = arena.allocator();
+
+    var args = try std.json.ObjectMap.init(allocator, &.{}, &.{});
+    try args.put(allocator, "pattern", .{ .string = ".gitignore" });
+
+    const result = try execute(allocator, .{ .tool = "glob", .args = .{ .object = args } }, null);
+    try testing.expect(std.mem.indexOf(u8, result, ".gitignore") == null);
+}
+
+test "glob recursive excludes ignored directories" {
+    const base_dir = ".tmp-glob-excluded-dirs";
+    std.Io.Dir.cwd().deleteTree(std.Options.debug_io, base_dir) catch |err| switch (err) {
+        error.FileNotFound => {},
+        else => return err,
+    };
+    defer std.Io.Dir.cwd().deleteTree(std.Options.debug_io, base_dir) catch {};
+
+    try std.Io.Dir.cwd().makePath(std.Options.debug_io, base_dir ++ std.fs.path.sep_str ++ "ok");
+    try std.Io.Dir.cwd().makePath(std.Options.debug_io, base_dir ++ std.fs.path.sep_str ++ ".git");
+    try std.Io.Dir.cwd().makePath(std.Options.debug_io, base_dir ++ std.fs.path.sep_str ++ ".zig-cache");
+    try std.Io.Dir.cwd().makePath(std.Options.debug_io, base_dir ++ std.fs.path.sep_str ++ "zig-pkg");
+    try std.Io.Dir.cwd().makePath(std.Options.debug_io, base_dir ++ std.fs.path.sep_str ++ "zig-out");
+
+    {
+        var file = try std.Io.Dir.cwd().createFile(std.Options.debug_io, base_dir ++ std.fs.path.sep_str ++ "ok" ++ std.fs.path.sep_str ++ "keep.zig", .{});
+        defer file.close(std.Options.debug_io);
+    }
+    {
+        var file = try std.Io.Dir.cwd().createFile(std.Options.debug_io, base_dir ++ std.fs.path.sep_str ++ ".git" ++ std.fs.path.sep_str ++ "skip.zig", .{});
+        defer file.close(std.Options.debug_io);
+    }
+    {
+        var file = try std.Io.Dir.cwd().createFile(std.Options.debug_io, base_dir ++ std.fs.path.sep_str ++ ".zig-cache" ++ std.fs.path.sep_str ++ "skip.zig", .{});
+        defer file.close(std.Options.debug_io);
+    }
+    {
+        var file = try std.Io.Dir.cwd().createFile(std.Options.debug_io, base_dir ++ std.fs.path.sep_str ++ "zig-pkg" ++ std.fs.path.sep_str ++ "skip.zig", .{});
+        defer file.close(std.Options.debug_io);
+    }
+    {
+        var file = try std.Io.Dir.cwd().createFile(std.Options.debug_io, base_dir ++ std.fs.path.sep_str ++ "zig-out" ++ std.fs.path.sep_str ++ "skip.zig", .{});
+        defer file.close(std.Options.debug_io);
+    }
+
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const allocator = arena.allocator();
+
+    var args = try std.json.ObjectMap.init(allocator, &.{}, &.{});
+    try args.put(allocator, "pattern", .{ .string = "**/*.zig" });
+    try args.put(allocator, "path", .{ .string = base_dir });
+
+    const result = try execute(allocator, .{ .tool = "glob", .args = .{ .object = args } }, null);
+    try testing.expect(std.mem.indexOf(u8, result, "keep.zig") != null);
+    try testing.expect(std.mem.indexOf(u8, result, ".git") == null);
+    try testing.expect(std.mem.indexOf(u8, result, ".zig-cache") == null);
+    try testing.expect(std.mem.indexOf(u8, result, "zig-pkg") == null);
+    try testing.expect(std.mem.indexOf(u8, result, "zig-out") == null);
+}
+
 test "edit exact replacement still works" {
     const path = ".tmp-edit-exact-test.txt";
     std.Io.Dir.cwd().deleteFile(std.Options.debug_io, path) catch |err| switch (err) {
@@ -842,6 +905,7 @@ fn globFiles(allocator: std.mem.Allocator, pattern: []const u8, search_path: ?[]
     // If pattern starts with **, search from cwd; otherwise search from search_path or cwd
     const base_path = search_path orelse ".";
     if (hasParentTraversal(base_path)) return std.fmt.allocPrint(allocator, "Error: Search path cannot contain ..", .{});
+    if (pathContainsExcludedGlobDir(base_path)) return allocator.dupe(u8, "");
 
     const full_base = resolveInsideCwd(allocator, base_path) catch |err| {
         return switch (err) {
@@ -885,6 +949,7 @@ fn globFiles(allocator: std.mem.Allocator, pattern: []const u8, search_path: ?[]
         var it = dir.iterate();
         while (try it.next(std.Options.debug_io)) |entry| {
             if (entry.kind == .directory) continue;
+            if (std.mem.eql(u8, entry.name, ".gitignore")) continue;
             if (!globMatch(entry.name, file_pattern)) continue;
             const rel_path = try std.fs.path.join(allocator, &.{ base_path, entry.name });
             defer allocator.free(rel_path);
@@ -908,12 +973,15 @@ fn globRecursive(allocator: std.mem.Allocator, dir_path: []const u8, pattern: []
                 std.mem.eql(u8, entry.name, "zig-cache") or
                 std.mem.eql(u8, entry.name, "zig-out") or
                 std.mem.eql(u8, entry.name, "node_modules") or
+                std.mem.eql(u8, entry.name, ".zig-cache") or
+                std.mem.eql(u8, entry.name, "zig-pkg") or
                 std.mem.eql(u8, entry.name, ".git")) continue;
 
             const sub_path = try std.fs.path.join(allocator, &.{ dir_path, entry.name });
             defer allocator.free(sub_path);
             try globRecursive(allocator, sub_path, pattern, results);
         } else if (entry.kind == .file) {
+            if (std.mem.eql(u8, entry.name, ".gitignore")) continue;
             if (!globMatch(entry.name, pattern)) continue;
             const rel_path = try relativeDisplayPath(allocator, dir_path);
             defer allocator.free(rel_path);
@@ -925,6 +993,21 @@ fn globRecursive(allocator: std.mem.Allocator, dir_path: []const u8, pattern: []
             try results.append(allocator, '\n');
         }
     }
+}
+
+fn isExcludedGlobDirName(name: []const u8) bool {
+    return std.mem.eql(u8, name, ".git") or
+        std.mem.eql(u8, name, ".zig-cache") or
+        std.mem.eql(u8, name, "zig-pkg") or
+        std.mem.eql(u8, name, "zig-out");
+}
+
+fn pathContainsExcludedGlobDir(path: []const u8) bool {
+    var it = std.fs.path.componentIterator(path);
+    while (it.next()) |component| {
+        if (isExcludedGlobDirName(component.name)) return true;
+    }
+    return false;
 }
 
 /// Match a filename against a glob pattern (supports * and ? wildcards only)
