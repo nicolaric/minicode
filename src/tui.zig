@@ -10,6 +10,9 @@ const syntax_highlight = @import("syntax_highlight.zig");
 const thinking_marker = "\x1fT";
 const user_marker = "\x1fU";
 const max_input = 16 * 1024;
+const welcome_input_width: usize = 70;
+const welcome_max_input_rows: usize = 5;
+const prompt_max_input_rows: usize = 5;
 
 const minicode_banner = "";
 
@@ -1495,6 +1498,7 @@ const App = struct {
         // Add initial spacing so first message isn't flush against top
         if (self.lines.items.len == 0) {
             try self.addLine("", .{});
+            try self.addLine("", .{});
         }
         try self.addLine(user_marker, .{});
         var it = std.mem.splitScalar(u8, text, '\n');
@@ -1656,7 +1660,17 @@ const App = struct {
         // Calculate layout
         const banner_height = banner_lines.items.len;
         const title_height = welcome_title_lines.len;
-        const input_box_height = 3; // top border + middle row + bottom border
+        // Calculate input box height dynamically based on text wrapping
+        const welcome_border_cols: usize = 1;
+        const welcome_input_left_padding: usize = 1;
+        const welcome_input_right_padding: usize = 1;
+        const welcome_input_prefix_cols = welcome_border_cols + welcome_input_left_padding;
+        const welcome_room_for_input: usize = if (welcome_input_width > welcome_input_prefix_cols + welcome_input_right_padding)
+            welcome_input_width - welcome_input_prefix_cols - welcome_input_right_padding
+        else
+            0;
+        const welcome_input_content_rows = self.welcomeInputRows(welcome_room_for_input);
+        const input_box_height = 2 + welcome_input_content_rows; // top border + content rows + bottom border
         const title_to_input_gap: usize = 3;
         const input_section_height = title_height + title_to_input_gap + input_box_height; // title + gap + input box
         const cool_stuff_height = 0;
@@ -1678,7 +1692,7 @@ const App = struct {
         }
 
         // Calculate centered input box dimensions
-        const input_width: usize = 70;
+        const input_width: usize = welcome_input_width;
         const input_left_margin = (cols - input_width) / 2;
 
         // Print welcome title as one centered block (fixed left edge)
@@ -1729,37 +1743,41 @@ const App = struct {
             try stdout.print("{s}\x1b[K\n", .{theme.mocha.mantle_bg});
         }
 
-        // Position cursor in the input box (single row, scrolls horizontally)
-        const content_width = if (input_width > 2) input_width - 2 else 1;
-        const window_start = if (self.cursor_pos >= content_width)
-            self.cursor_pos - content_width + 1
-        else
-            0;
-        const cursor_col_in_box = self.cursor_pos - window_start;
-        const input_row = top_margin + welcome_title_lines.len + 2; // Middle row on welcome input box
-        const cursor_col = input_left_margin + 3 + cursor_col_in_box; // After lavender border + one empty column
+        const cursor_row = if (welcome_room_for_input == 0) 0 else self.cursor_pos / welcome_room_for_input;
+        const first_visible_row = self.firstVisibleWelcomeInputRow(welcome_room_for_input);
+        const cursor_row_in_box = cursor_row - first_visible_row;
+        const cursor_col_in_box = if (welcome_room_for_input == 0) 0 else self.cursor_pos % welcome_room_for_input;
+        const input_row = @max(1, top_margin + welcome_title_lines.len + title_to_input_gap + cursor_row_in_box - 1);
+        const cursor_col = input_left_margin + welcome_input_prefix_cols + cursor_col_in_box + 1;
         try stdout.print("\x1b[{d};{d}H\x1b[?25h", .{ input_row, cursor_col });
+    }
+
+    fn welcomeInputRows(self: *App, room_for_input: usize) usize {
+        if (room_for_input == 0) return 1;
+        const rows_for_text = wrappedRows(self.input.items.len, room_for_input);
+        const rows_for_cursor = self.cursor_pos / room_for_input + 1;
+        return @min(@max(rows_for_text, rows_for_cursor), welcome_max_input_rows);
+    }
+
+    fn firstVisibleWelcomeInputRow(self: *App, room_for_input: usize) usize {
+        if (room_for_input == 0) return 0;
+        const cursor_row = self.cursor_pos / room_for_input;
+        if (cursor_row >= welcome_max_input_rows) return cursor_row - welcome_max_input_rows + 1;
+        return 0;
     }
 
     fn printWelcomeInputArea(self: *App, stdout: anytype, input_width: usize, left_margin: usize) !void {
         const border_cols: usize = 1;
         const input_left_padding: usize = 1; // Keep first column inside box empty
-        const input_right_padding: usize = 0;
+        const input_right_padding: usize = 1;
         const input_prefix_cols = border_cols + input_left_padding;
         const room_for_input: usize = if (input_width > input_prefix_cols + input_right_padding)
             input_width - input_prefix_cols - input_right_padding
         else
             0;
 
-        // Determine visible window of input that includes the cursor
-        const window_start = if (room_for_input == 0)
-            self.cursor_pos
-        else if (self.cursor_pos >= room_for_input)
-            self.cursor_pos - room_for_input + 1
-        else
-            0;
-        const visible_len = if (room_for_input == 0) 0 else @min(room_for_input, self.input.items.len - window_start);
-        const visible_input = self.input.items[window_start .. window_start + visible_len];
+        const content_rows = self.welcomeInputRows(room_for_input);
+        const first_visible_row = self.firstVisibleWelcomeInputRow(room_for_input);
 
         // Top row of input box - lavender border left, dark background
         try stdout.print("{s}", .{theme.mocha.mantle_bg});
@@ -1771,19 +1789,30 @@ const App = struct {
         if (border_cols < input_width) try stdout.splatByteAll(' ', input_width - border_cols);
         try stdout.print("{s}\x1b[K{s}\n", .{ theme.mocha.mantle_bg, theme.reset });
 
-        // Middle row with input text - lavender border left, dark background
-        try stdout.print("{s}", .{theme.mocha.mantle_bg});
-        try stdout.splatByteAll(' ', left_margin);
-        try stdout.print("{s}▌{s}", .{
-            theme.mocha.lavender,
-            theme.mocha.surface0_bg,
-        });
-        if (input_left_padding > 0) try stdout.splatByteAll(' ', input_left_padding);
-        try stdout.print("{s}{s}", .{ theme.mocha.text, visible_input });
-        const max_used_cols = input_width - input_right_padding;
-        const used_cols = @min(max_used_cols, input_prefix_cols + visible_input.len);
-        if (used_cols < max_used_cols) try stdout.splatByteAll(' ', max_used_cols - used_cols);
-        try stdout.print("{s}\x1b[K{s}\n", .{ theme.mocha.mantle_bg, theme.reset });
+        var input_row: usize = 0;
+        while (input_row < content_rows) : (input_row += 1) {
+            const absolute_input_row = first_visible_row + input_row;
+            const row_start = absolute_input_row * room_for_input;
+            const visible_input = if (room_for_input == 0 or row_start >= self.input.items.len)
+                ""
+            else blk: {
+                const row_end = @min(self.input.items.len, row_start + room_for_input);
+                break :blk self.input.items[row_start..row_end];
+            };
+
+            try stdout.print("{s}", .{theme.mocha.mantle_bg});
+            try stdout.splatByteAll(' ', left_margin);
+            try stdout.print("{s}▌{s}", .{
+                theme.mocha.lavender,
+                theme.mocha.surface0_bg,
+            });
+            if (input_left_padding > 0) try stdout.splatByteAll(' ', input_left_padding);
+            try stdout.print("{s}{s}", .{ theme.mocha.text, visible_input });
+            const max_used_cols = input_width;
+            const used_cols = @min(max_used_cols, input_prefix_cols + visible_input.len);
+            if (used_cols < max_used_cols) try stdout.splatByteAll(' ', max_used_cols - used_cols);
+            try stdout.print("{s}\x1b[K{s}\n", .{ theme.mocha.mantle_bg, theme.reset });
+        }
 
         // Bottom row of input box - lavender border left, dark background
         try stdout.print("{s}", .{theme.mocha.mantle_bg});
@@ -1816,18 +1845,32 @@ const App = struct {
         const right_margin: usize = 3;
         const inner_cols: usize = @max(4, @as(usize, cols) - left_margin - right_margin);
         self.inner_cols = inner_cols;
-        const input_rows: usize = 6;
         const input_inner_cols = if (inner_cols > 1) inner_cols - 1 else inner_cols;
+        const prompt_room_for_input = promptRoomForInput(input_inner_cols);
+        const max_prompt_rows = @min(prompt_max_input_rows, rows - 5);
+        const input_content_rows = self.promptInputRows(prompt_room_for_input, max_prompt_rows);
+        const input_rows: usize = 4 + input_content_rows;
         const content_rows: usize = rows - input_rows;
 
         try stdout.print("\x1b[?25l{s}\x1b[H", .{theme.mocha.mantle_bg});
 
+        const top_margin: usize = 2;
+        // Print top margin blank rows
+        var margin_row: usize = 0;
+        while (margin_row < top_margin) : (margin_row += 1) {
+            try stdout.print("{s}", .{theme.mocha.mantle_bg});
+            try self.writeMargin(stdout, left_margin);
+            try stdout.splatByteAll(' ', inner_cols);
+            try stdout.print("\x1b[K{s}\n", .{theme.reset});
+        }
+
+        const content_rows_with_margin = content_rows - top_margin;
         const wrapped_count = self.countWrappedRows(inner_cols);
-        const max_scroll = if (wrapped_count > content_rows) wrapped_count - content_rows else 0;
+        const max_scroll = if (wrapped_count > content_rows_with_margin) wrapped_count - content_rows_with_margin else 0;
         const first_row_to_show = @min(self.scroll_offset, max_scroll);
 
-        const printed_rows = try self.printConversation(stdout, inner_cols, left_margin, first_row_to_show, content_rows);
-        var filled = printed_rows;
+        const printed_rows = try self.printConversation(stdout, inner_cols, left_margin, first_row_to_show, content_rows_with_margin);
+        var filled = top_margin + printed_rows;
         while (filled < content_rows) : (filled += 1) {
             try stdout.print("{s}", .{theme.mocha.mantle_bg});
             try self.writeMargin(stdout, left_margin);
@@ -1835,12 +1878,15 @@ const App = struct {
             try stdout.print("\x1b[K{s}\n", .{theme.reset});
         }
 
-        try self.printScrollbar(stdout, @as(usize, cols), content_rows, wrapped_count, first_row_to_show, max_scroll);
+        try self.printScrollbar(stdout, @as(usize, cols), content_rows_with_margin, wrapped_count, first_row_to_show, max_scroll, top_margin + 1);
 
-        const cursor_col = try self.printInputArea(stdout, prompt, input_inner_cols, left_margin);
+        const cursor_col = try self.printInputArea(stdout, prompt, input_inner_cols, left_margin, max_prompt_rows);
         try stdout.print("{s}", .{theme.reset});
 
-        const input_row = rows - 4;
+        const cursor_row = if (prompt_room_for_input == 0) 0 else self.cursor_pos / prompt_room_for_input;
+        const first_visible_row = self.firstVisiblePromptInputRow(prompt_room_for_input, max_prompt_rows);
+        const cursor_row_in_box = cursor_row - first_visible_row;
+        const input_row = content_rows + 1 + cursor_row_in_box;
         try stdout.print("\x1b[{d};{d}H\x1b[?25h", .{ input_row, cursor_col });
     }
 
@@ -1907,7 +1953,7 @@ const App = struct {
         return printed;
     }
 
-    fn printScrollbar(self: *App, stdout: anytype, cols: usize, content_rows: usize, total_rows: usize, first_row: usize, max_scroll: usize) !void {
+    fn printScrollbar(self: *App, stdout: anytype, cols: usize, content_rows: usize, total_rows: usize, first_row: usize, max_scroll: usize, start_row: usize) !void {
         _ = self;
         if (cols < 2 or content_rows == 0 or total_rows <= content_rows) return;
 
@@ -1922,7 +1968,7 @@ const App = struct {
             const is_thumb = row >= thumb_start and row < thumb_end;
             const glyph = if (is_thumb) "█" else "│";
             const color = if (is_thumb) theme.mocha.subtext0 else theme.mocha.surface0;
-            try stdout.print("\x1b[{d};{d}H{s}{s}{s}", .{ row + 1, scrollbar_col, color, glyph, theme.reset });
+            try stdout.print("\x1b[{d};{d}H{s}{s}{s}", .{ start_row + row, scrollbar_col, color, glyph, theme.reset });
         }
     }
 
@@ -1942,11 +1988,13 @@ const App = struct {
         return if (inner_cols > reserved) inner_cols - reserved else 1;
     }
 
-    fn getContentRows(_: *App) usize {
+    fn getContentRows(self: *App) usize {
         const size = terminal.size();
         if (size.rows < 7) return 1;
         const rows = size.rows;
-        const input_rows: usize = 5;
+        const input_inner_cols = if (self.inner_cols > 1) self.inner_cols - 1 else self.inner_cols;
+        const max_prompt_rows = @min(prompt_max_input_rows, rows - 5);
+        const input_rows: usize = 4 + self.promptInputRows(promptRoomForInput(input_inner_cols), max_prompt_rows);
         return rows - input_rows;
     }
 
@@ -1963,26 +2011,40 @@ const App = struct {
         try stdout.print("\x1b[K\n", .{});
     }
 
-    fn printInputArea(self: *App, stdout: anytype, prompt: []const u8, inner_cols: usize, left_margin: usize) !usize {
-        _ = prompt;
+    fn promptRoomForInput(inner_cols: usize) usize {
         const border_cols: usize = 1;
+        const input_left_padding: usize = 1;
         const input_right_padding: usize = 1;
-        const input_prefix_cols = border_cols + 1;
-        const room_for_input: usize = if (inner_cols > input_prefix_cols + input_right_padding)
+        const input_prefix_cols = border_cols + input_left_padding;
+        return if (inner_cols > input_prefix_cols + input_right_padding)
             inner_cols - input_prefix_cols - input_right_padding
         else
             0;
+    }
 
-        // Determine visible window of input that includes the cursor
-        const window_start = if (room_for_input == 0)
-            self.cursor_pos
-        else if (self.cursor_pos >= room_for_input)
-            self.cursor_pos - room_for_input + 1
-        else
-            0;
-        const visible_len = if (room_for_input == 0) 0 else @min(room_for_input, self.input.items.len - window_start);
-        const visible_input = self.input.items[window_start .. window_start + visible_len];
-        const cursor_in_visible = if (room_for_input == 0) 0 else self.cursor_pos - window_start;
+    fn promptInputRows(self: *App, room_for_input: usize, max_rows: usize) usize {
+        if (room_for_input == 0) return 1;
+        const rows_for_text = wrappedRows(self.input.items.len, room_for_input);
+        const rows_for_cursor = self.cursor_pos / room_for_input + 1;
+        return @min(@max(rows_for_text, rows_for_cursor), max_rows);
+    }
+
+    fn firstVisiblePromptInputRow(self: *App, room_for_input: usize, max_rows: usize) usize {
+        if (room_for_input == 0) return 0;
+        const cursor_row = self.cursor_pos / room_for_input;
+        if (cursor_row >= max_rows) return cursor_row - max_rows + 1;
+        return 0;
+    }
+
+    fn printInputArea(self: *App, stdout: anytype, prompt: []const u8, inner_cols: usize, left_margin: usize, max_input_rows: usize) !usize {
+        _ = prompt;
+        const border_cols: usize = 1;
+        const input_left_padding: usize = 1;
+        const input_right_padding: usize = 1;
+        const input_prefix_cols = border_cols + input_left_padding;
+        const room_for_input = promptRoomForInput(inner_cols);
+        const content_rows = self.promptInputRows(room_for_input, max_input_rows);
+        const first_visible_row = self.firstVisiblePromptInputRow(room_for_input, max_input_rows);
 
         // Top border - lavender left border, dark background
         try stdout.print("{s}", .{theme.mocha.mantle_bg});
@@ -1994,19 +2056,30 @@ const App = struct {
         if (border_cols < inner_cols) try stdout.splatByteAll(' ', inner_cols - border_cols);
         try stdout.print("{s}\x1b[K{s}\n", .{ theme.mocha.mantle_bg, theme.reset });
 
-        // Input row with text - lavender left border, dark background
-        try stdout.print("{s}", .{theme.mocha.mantle_bg});
-        try self.writeMargin(stdout, left_margin);
-        try stdout.print("{s}▌{s} {s}{s}", .{
-            theme.mocha.lavender,
-            theme.mocha.surface0_bg,
-            theme.mocha.text,
-            visible_input,
-        });
-        const max_used_cols = inner_cols - input_right_padding;
-        const used_cols = @min(max_used_cols, input_prefix_cols + visible_input.len);
-        if (used_cols < max_used_cols) try stdout.splatByteAll(' ', max_used_cols - used_cols);
-        try stdout.print("{s}\x1b[K{s}\n", .{ theme.mocha.mantle_bg, theme.reset });
+        var input_row: usize = 0;
+        while (input_row < content_rows) : (input_row += 1) {
+            const absolute_input_row = first_visible_row + input_row;
+            const row_start = absolute_input_row * room_for_input;
+            const visible_input = if (room_for_input == 0 or row_start >= self.input.items.len)
+                ""
+            else blk: {
+                const row_end = @min(self.input.items.len, row_start + room_for_input);
+                break :blk self.input.items[row_start..row_end];
+            };
+
+            try stdout.print("{s}", .{theme.mocha.mantle_bg});
+            try self.writeMargin(stdout, left_margin);
+            try stdout.print("{s}▌{s}", .{
+                theme.mocha.lavender,
+                theme.mocha.surface0_bg,
+            });
+            if (input_left_padding > 0) try stdout.splatByteAll(' ', input_left_padding);
+            try stdout.print("{s}{s}", .{ theme.mocha.text, visible_input });
+            const max_used_cols = inner_cols - input_right_padding;
+            const used_cols = @min(max_used_cols, input_prefix_cols + visible_input.len);
+            if (used_cols < max_used_cols) try stdout.splatByteAll(' ', max_used_cols - used_cols);
+            try stdout.print("{s}\x1b[K{s}\n", .{ theme.mocha.mantle_bg, theme.reset });
+        }
 
         // Bottom border - lavender left border, dark background
         try stdout.print("{s}", .{theme.mocha.mantle_bg});
@@ -2026,7 +2099,8 @@ const App = struct {
         try stdout.splatByteAll(' ', inner_cols);
         try stdout.print("\x1b[K{s}\n", .{theme.reset});
 
-        return left_margin + border_cols + 1 + cursor_in_visible + 1;
+        const cursor_col_in_box = if (room_for_input == 0) 0 else self.cursor_pos % room_for_input;
+        return left_margin + border_cols + input_left_padding + cursor_col_in_box + 1;
     }
 
     fn printPendingLoader(self: *App, stdout: anytype, inner_cols: usize, left_margin: usize) !void {
