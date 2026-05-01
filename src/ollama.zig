@@ -206,7 +206,7 @@ pub fn chatStreamWithCurl(
         curl_executable,
         "-s",
         "-N",
-        "--max-time", "120",
+        "--max-time", "300",
         "-X", "POST",
         "-H", "Content-Type: application/json",
         "-d", body_bytes,
