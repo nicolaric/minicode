@@ -83,6 +83,10 @@ fn completeTurn(allocator: std.mem.Allocator, cfg: config.Config, messages: *std
         if (response.tool_calls) |tool_calls| {
             for (tool_calls) |call| {
                 const request = tools.requestFromToolCall(call);
+                if (std.mem.eql(u8, request.tool, "edit")) {
+                    try stdout.print("Patching file...\n\n", .{});
+                    try messages.append(allocator, .{ .role = .assistant, .content = "Patching file...", .thinking = null, .tool_calls = null });
+                }
                 const result = tools.execute(allocator, request, null) catch |err| try std.fmt.allocPrint(allocator, "Tool error: {s}", .{@errorName(err)});
                 defer allocator.free(result);
                 tools.logToolCall(allocator, request, result);
@@ -103,6 +107,10 @@ fn completeTurn(allocator: std.mem.Allocator, cfg: config.Config, messages: *std
         var maybe_tool = try tools.parseToolRequest(allocator, response.content);
         if (maybe_tool) |*parsed| {
             defer parsed.deinit();
+            if (std.mem.eql(u8, parsed.value.tool, "edit")) {
+                try stdout.print("Patching file...\n\n", .{});
+                try messages.append(allocator, .{ .role = .assistant, .content = "Patching file...", .thinking = null, .tool_calls = null });
+            }
             const result = tools.execute(allocator, parsed.value, null) catch |err| try std.fmt.allocPrint(allocator, "Tool error: {s}", .{@errorName(err)});
             defer allocator.free(result);
             tools.logToolCall(allocator, parsed.value, result);
