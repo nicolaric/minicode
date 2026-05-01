@@ -1743,17 +1743,51 @@ fn diffAlloc(allocator: std.mem.Allocator, old_content: []const u8, new_content:
         return try allocator.dupe(u8, "(no changes)");
     }
 
+    const diff_context_lines: usize = 3;
+
+    var render_lines = try allocator.alloc(bool, diff_lines.items.len);
+    defer allocator.free(render_lines);
+    @memset(render_lines, false);
+
+    for (diff_lines.items, 0..) |dl, index| {
+        const is_change = dl.old_line == null or dl.new_line == null or
+            (dl.old_idx != null and dl.new_idx != null and
+                !std.mem.eql(u8, old_lines.items[dl.old_idx.?], new_lines.items[dl.new_idx.?]));
+        if (!is_change) continue;
+
+        const start = if (index > diff_context_lines) index - diff_context_lines else 0;
+        const end = @min(diff_lines.items.len, index + diff_context_lines + 1);
+        for (render_lines[start..end]) |*should_render| should_render.* = true;
+    }
+
     // ANSI color codes
     const red_bg = "\x1b[48;2;69;40;48m"; // Dark red background (like in screenshot)
     const green_bg = "\x1b[48;2;40;69;48m"; // Dark green background (like in screenshot)
     const dim_text = "\x1b[38;5;245m"; // Dim gray for context lines
     const normal_text = "\x1b[0m"; // Reset
 
-    // Fixed column positions for alignment
-    const left_content_width = 45; // Max width for left side content
+    // Calculate column width based on terminal size for centered split
+    const term_width: usize = blk: {
+        var ws: std.posix.winsize = .{ .row = 0, .col = 0, .xpixel = 0, .ypixel = 0 };
+        const err = std.posix.system.ioctl(std.Io.File.stdout().handle, std.posix.T.IOCGWINSZ, @intFromPtr(&ws));
+        break :blk if (std.posix.errno(err) == .SUCCESS and ws.col > 20) ws.col else 80;
+    };
+    // Total per side: line_num(4) + spaces(2) + content + gap(5)
+    // Each side content width = (term_width - gap - line_num - spaces) / 2
+    const left_content_width = (term_width - 11) / 2;
 
-    // Render side-by-side diff
-    for (diff_lines.items) |dl| {
+    // Render side-by-side diff with compact context hunks.
+    var previous_rendered = false;
+    for (diff_lines.items, 0..) |dl, index| {
+        if (!render_lines[index]) {
+            if (previous_rendered) {
+                try result.appendSlice(allocator, "      ...                                           ...\n");
+                previous_rendered = false;
+            }
+            continue;
+        }
+        previous_rendered = true;
+
         const is_change = dl.old_line == null or dl.new_line == null or
             (dl.old_idx != null and dl.new_idx != null and
                 !std.mem.eql(u8, old_lines.items[dl.old_idx.?], new_lines.items[dl.new_idx.?]));

@@ -1498,7 +1498,6 @@ const App = struct {
         // Add initial spacing so first message isn't flush against top
         if (self.lines.items.len == 0) {
             try self.addLine("", .{});
-            try self.addLine("", .{});
         }
         try self.addLine(user_marker, .{});
         var it = std.mem.splitScalar(u8, text, '\n');
