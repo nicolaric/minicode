@@ -68,6 +68,20 @@ fn restoreForeground(stdin_fd: std.posix.fd_t, pgrp: std.posix.pid_t) void {
     }.setForeground, stdin_fd, pgrp);
 }
 
+pub fn ensureForeground(stdin_fd: std.posix.fd_t) void {
+    const current_pgrp = tcgetpgrp(stdin_fd);
+    if (current_pgrp == -1) return;
+
+    const own_pgrp = getpgrp();
+    if (current_pgrp == own_pgrp) return;
+
+    withTtouIgnored(struct {
+        fn setForeground(fd: std.posix.fd_t, pgrp: std.posix.pid_t) void {
+            _ = tcsetpgrp(fd, pgrp);
+        }
+    }.setForeground, stdin_fd, own_pgrp);
+}
+
 fn withTtouIgnored(comptime callback: fn (std.posix.fd_t, std.posix.pid_t) void, fd: std.posix.fd_t, pgrp: std.posix.pid_t) void {
     var old_ttou: std.posix.Sigaction = undefined;
     const ignore_ttou: std.posix.Sigaction = .{

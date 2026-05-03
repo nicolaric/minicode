@@ -9,10 +9,13 @@ const syntax_highlight = @import("syntax_highlight.zig");
 
 const thinking_marker = "\x1fT";
 const user_marker = "\x1fU";
+const diff_box_marker = "\x1fD";
 const max_input = 16 * 1024;
 const welcome_input_width: usize = 70;
 const welcome_max_input_rows: usize = 5;
 const prompt_max_input_rows: usize = 5;
+const model_modal_padding: usize = 2;
+const model_modal_vertical_padding: usize = 1;
 
 const minicode_banner = "";
 
@@ -37,6 +40,7 @@ const welcome_title_lines = [_][]const u8{
 const App = struct {
     allocator: std.mem.Allocator,
     cfg: config.Config,
+    owned_model: ?[]u8,
     messages: std.ArrayList(ollama.Message),
     lines: std.ArrayList([]u8),
     input: std.ArrayList(u8),
@@ -60,12 +64,32 @@ const App = struct {
     highlighter: ?*syntax_highlight.SyntaxHighlighter,
     // Welcome screen state
     show_welcome: bool,
+    show_model_modal: bool,
+    model_names: ?[][]u8,
+    model_error: ?[]u8,
+    model_selected: usize,
 
     fn init(allocator: std.mem.Allocator, cfg: config.Config) !App {
         const highlighter = try syntax_highlight.SyntaxHighlighter.create(allocator);
+        errdefer highlighter.destroy();
+
+        var effective_cfg = cfg;
+        var owned_model: ?[]u8 = null;
+        if (!cfg.model_explicit) {
+            if (ollama.listModels(allocator, cfg)) |models| {
+                defer ollama.freeModels(allocator, models);
+                if (models.len > 0) {
+                    owned_model = try allocator.dupe(u8, models[0]);
+                    effective_cfg.model = owned_model.?;
+                }
+            } else |_| {}
+        }
+        errdefer if (owned_model) |model| allocator.free(model);
+
         return .{
             .allocator = allocator,
-            .cfg = cfg,
+            .cfg = effective_cfg,
+            .owned_model = owned_model,
             .messages = .empty,
             .lines = .empty,
             .input = .empty,
@@ -86,21 +110,20 @@ const App = struct {
             .read_continuations = .empty,
             .highlighter = highlighter,
             .show_welcome = true,
+            .show_model_modal = false,
+            .model_names = null,
+            .model_error = null,
+            .model_selected = 0,
         };
     }
 
     fn deinit(self: *App) void {
-        for (self.messages.items) |message| {
-            self.allocator.free(message.content);
-            if (message.thinking) |thinking| self.allocator.free(thinking);
-            if (message.tool_calls) |tool_calls| ollama.freeToolCalls(self.allocator, tool_calls);
-            if (message.tool_name) |tool_name| self.allocator.free(tool_name);
-            if (message.tool_call_id) |tool_call_id| self.allocator.free(tool_call_id);
-        }
+        self.clearMessages();
         self.messages.deinit(self.allocator);
-        for (self.lines.items) |line| self.allocator.free(line);
+        self.clearLines();
         self.lines.deinit(self.allocator);
         self.input.deinit(self.allocator);
+        if (self.owned_model) |model| self.allocator.free(model);
         self.stream_content.deinit(self.allocator);
         self.stream_thinking.deinit(self.allocator);
         self.clearStreamToolCalls();
@@ -111,12 +134,14 @@ const App = struct {
         self.grep_matches.deinit(self.allocator);
         self.clearReadContinuations();
         self.read_continuations.deinit(self.allocator);
+        self.clearModelModalData();
         if (self.highlighter) |h| h.destroy();
     }
 
     fn start(self: *App) !void {
-        try self.messages.append(self.allocator, .{ .role = .system, .content = try self.allocator.dupe(u8, agent.system_prompt) });
+        try self.addSystemPrompt();
         try self.render();
+        ollama.preloadModel(self.allocator, self.cfg) catch {};
     }
 
     fn loop(self: *App) !void {
@@ -125,7 +150,13 @@ const App = struct {
         const stdin = &stdin_file.interface;
         while (true) {
             var byte: [1]u8 = undefined;
-            if (try stdin.readSliceShort(&byte) == 0) break;
+            const read_len = stdin.readSliceShort(&byte) catch {
+                terminal.ensureForeground(std.posix.STDIN_FILENO);
+                sleepAfterInputError();
+                continue;
+            };
+            if (read_len == 0) continue;
+            if (self.show_model_modal and try self.handleModelModalKey(stdin, byte[0])) continue;
             switch (byte[0]) {
                 3 => { // Ctrl+C - exit the app (cancel streaming if active)
                     if (self.is_busy) {
@@ -156,7 +187,23 @@ const App = struct {
                         try self.render();
                         continue;
                     }
-                    if (std.mem.eql(u8, trimmed, "/exit") or std.mem.eql(u8, trimmed, "/quit")) break;
+                    if (std.mem.eql(u8, trimmed, "/exit") or std.mem.eql(u8, trimmed, "/quit")) {
+                        self.input.clearRetainingCapacity();
+                        self.cursor_pos = 0;
+                        try self.addLine("Use Ctrl+C to exit.", .{});
+                        try self.render();
+                        continue;
+                    }
+                    if (std.mem.eql(u8, trimmed, "/new")) {
+                        try self.resetConversation();
+                        try self.render();
+                        continue;
+                    }
+                    if (std.mem.eql(u8, trimmed, "/model")) {
+                        try self.openModelModal();
+                        try self.render();
+                        continue;
+                    }
 
                     // Switch from welcome screen to normal view on first message
                     const is_first_message = self.show_welcome;
@@ -306,6 +353,127 @@ const App = struct {
         while (self.cursor_pos < self.input.items.len and !isWordSeparator(self.input.items[self.cursor_pos])) {
             self.cursor_pos += 1;
         }
+    }
+
+    fn clearModelModalData(self: *App) void {
+        if (self.model_names) |names| {
+            ollama.freeModels(self.allocator, names);
+            self.model_names = null;
+        }
+        if (self.model_error) |message| {
+            self.allocator.free(message);
+            self.model_error = null;
+        }
+        self.model_selected = 0;
+    }
+
+    fn openModelModal(self: *App) !void {
+        self.clearModelModalData();
+        self.show_model_modal = true;
+        self.model_names = ollama.listModels(self.allocator, self.cfg) catch |err| blk: {
+            self.model_error = try std.fmt.allocPrint(self.allocator, "Could not load Ollama models: {s}", .{@errorName(err)});
+            break :blk null;
+        };
+    }
+
+    fn closeModelModal(self: *App) void {
+        self.show_model_modal = false;
+    }
+
+    fn addSystemPrompt(self: *App) !void {
+        try self.messages.append(self.allocator, .{ .role = .system, .content = try self.allocator.dupe(u8, agent.system_prompt) });
+    }
+
+    fn clearMessages(self: *App) void {
+        for (self.messages.items) |message| {
+            self.allocator.free(message.content);
+            if (message.thinking) |thinking| self.allocator.free(thinking);
+            if (message.tool_calls) |tool_calls| ollama.freeToolCalls(self.allocator, tool_calls);
+            if (message.tool_name) |tool_name| self.allocator.free(tool_name);
+            if (message.tool_call_id) |tool_call_id| self.allocator.free(tool_call_id);
+        }
+        self.messages.clearRetainingCapacity();
+    }
+
+    fn clearLines(self: *App) void {
+        for (self.lines.items) |line| self.allocator.free(line);
+        self.lines.clearRetainingCapacity();
+    }
+
+    fn resetConversation(self: *App) !void {
+        self.clearMessages();
+        try self.addSystemPrompt();
+        self.clearLines();
+        self.input.clearRetainingCapacity();
+        self.cursor_pos = 0;
+        self.scroll_offset = 0;
+        self.input_cleared = false;
+        self.is_busy = false;
+        self.cancel_requested = false;
+        self.stream_content.clearRetainingCapacity();
+        self.stream_thinking.clearRetainingCapacity();
+        self.clearStreamToolCalls();
+        self.stream_lines_start = 0;
+        self.thinking_started = false;
+        self.clearReadRequests();
+        self.clearGrepMatches();
+        self.clearReadContinuations();
+        self.show_welcome = true;
+    }
+
+    fn handleModelModalKey(self: *App, stdin: anytype, ch: u8) !bool {
+        switch (ch) {
+            3, 'q' => {
+                self.closeModelModal();
+                try self.render();
+                return true;
+            },
+            '\r', '\n' => {
+                self.closeModelModal();
+                try self.render();
+                return true;
+            },
+            else => {},
+        }
+
+        const count = if (self.model_names) |names| names.len else 0;
+        if (ch == 27) {
+            var seq: [1]u8 = undefined;
+            const n = stdin.readSliceShort(&seq) catch 0;
+            if (n == 0) {
+                self.closeModelModal();
+                try self.render();
+                return true;
+            }
+            if (seq[0] != '[') return true;
+
+            var seq2: [1]u8 = undefined;
+            const n2 = stdin.readSliceShort(&seq2) catch 0;
+            if (n2 == 0) return true;
+            switch (seq2[0]) {
+                'A' => {
+                    if (self.model_selected > 0) self.model_selected -= 1;
+                },
+                'B' => {
+                    if (self.model_selected + 1 < count) self.model_selected += 1;
+                },
+                else => {},
+            }
+            try self.render();
+            return true;
+        }
+
+        switch (ch) {
+            'k' => {
+                if (self.model_selected > 0) self.model_selected -= 1;
+            },
+            'j' => {
+                if (self.model_selected + 1 < count) self.model_selected += 1;
+            },
+            else => return false,
+        }
+        try self.render();
+        return true;
     }
 
     fn deleteWordLeft(self: *App) void {
@@ -539,7 +707,9 @@ const App = struct {
                     defer self.allocator.free(summary);
                     self.removeLineAt(self.lines.items.len - 1);
                     try self.addLine("{s}", .{summary});
-                    if (tool_failed) try self.addToolError(result);
+                    if (std.mem.eql(u8, safe_tool, "run_shell")) {
+                        try self.addShellResultDetails(request.args, result, tool_failed);
+                    } else if (tool_failed) try self.addToolError(result);
                     if (std.mem.eql(u8, safe_tool, "edit") or std.mem.eql(u8, safe_tool, "write_file")) {
                         try self.addToolResultDetails(result);
                     }
@@ -617,7 +787,9 @@ const App = struct {
                 defer self.allocator.free(summary);
                 self.removeLineAt(self.lines.items.len - 1);
                 try self.addLine("{s}", .{summary});
-                if (tool_failed) {
+                if (std.mem.eql(u8, safe_tool, "run_shell")) {
+                    try self.addShellResultDetails(parsed.value.args, result, tool_failed);
+                } else if (tool_failed) {
                     try self.addToolError(result);
                 }
                 if (std.mem.eql(u8, safe_tool, "edit") or std.mem.eql(u8, safe_tool, "write_file")) {
@@ -932,14 +1104,45 @@ const App = struct {
     }
 
     fn addToolResultDetails(self: *App, result: []const u8) !void {
+        try self.addLine(diff_box_marker, .{});
         var it = std.mem.splitScalar(u8, result, '\n');
         while (it.next()) |line| {
             // Diff output already contains ANSI color codes - don't sanitize them
             // Just ensure no harmful control characters
             const safe_line = try sanitizeAnsiAlloc(self.allocator, line);
             defer self.allocator.free(safe_line);
-            try self.addLine("  {s}", .{safe_line});
+            try self.addLine(diff_box_marker ++ "{s}", .{safe_line});
         }
+        try self.addLine(diff_box_marker, .{});
+    }
+
+    fn addShellResultDetails(self: *App, args: std.json.Value, result: []const u8, failed: bool) !void {
+        const command = if (args == .object) blk: {
+            const value = args.object.get("command") orelse break :blk "unknown";
+            break :blk if (value == .string) value.string else "unknown";
+        } else "unknown";
+        const safe_command = try sanitizeAlloc(self.allocator, command);
+        defer self.allocator.free(safe_command);
+
+        try self.addLine(diff_box_marker, .{});
+        try self.addLine(diff_box_marker ++ "{s}$ {s}{s}", .{ theme.mocha.blue, safe_command, theme.reset });
+        try self.addLine(diff_box_marker, .{});
+
+        if (result.len == 0) {
+            try self.addLine(diff_box_marker ++ "{s}(no output){s}", .{ theme.mocha.subtext0, theme.reset });
+        } else {
+            var it = std.mem.splitScalar(u8, result, '\n');
+            while (it.next()) |line| {
+                const safe_line = try sanitizeAnsiAlloc(self.allocator, line);
+                defer self.allocator.free(safe_line);
+                if (failed) {
+                    try self.addLine(diff_box_marker ++ "{s}{s}{s}", .{ theme.mocha.red, safe_line, theme.reset });
+                } else {
+                    try self.addLine(diff_box_marker ++ "{s}", .{safe_line});
+                }
+            }
+        }
+        try self.addLine(diff_box_marker, .{});
     }
 
     fn addToolError(self: *App, result: []const u8) !void {
@@ -1033,17 +1236,24 @@ const App = struct {
         }
     }
 
-    fn confirmCallback(ctx: *anyopaque, _: []const u8) anyerror!bool {
+    fn confirmCallback(ctx: *anyopaque, prompt: []const u8) anyerror!bool {
         const self: *App = @ptrCast(@alignCast(ctx));
         self.input.clearRetainingCapacity();
-        try self.renderPrompt("confirm y/N");
+        const safe_prompt = try sanitizeAlloc(self.allocator, prompt);
+        defer self.allocator.free(safe_prompt);
+        try self.renderPrompt(safe_prompt);
 
         var stdin_buf: [256]u8 = undefined;
         var stdin_file = std.Io.File.stdin().readerStreaming(std.Options.debug_io, &stdin_buf);
         const stdin = &stdin_file.interface;
         while (true) {
             var byte: [1]u8 = undefined;
-            if (try stdin.readSliceShort(&byte) == 0) return false;
+            const read_len = stdin.readSliceShort(&byte) catch {
+                terminal.ensureForeground(std.posix.STDIN_FILENO);
+                sleepAfterInputError();
+                continue;
+            };
+            if (read_len == 0) continue;
             switch (byte[0]) {
                 'y', 'Y' => return true,
                 'n', 'N', '\r', '\n', 27, 3 => return false,
@@ -1742,6 +1952,12 @@ const App = struct {
             try stdout.print("{s}\x1b[K\n", .{theme.mocha.mantle_bg});
         }
 
+        if (self.show_model_modal) {
+            try self.printModelModal(stdout, rows, cols);
+            try stdout.writeAll("\x1b[?25l");
+            return;
+        }
+
         const cursor_row = if (welcome_room_for_input == 0) 0 else self.cursor_pos / welcome_room_for_input;
         const first_visible_row = self.firstVisibleWelcomeInputRow(welcome_room_for_input);
         const cursor_row_in_box = cursor_row - first_visible_row;
@@ -1878,9 +2094,16 @@ const App = struct {
         }
 
         try self.printScrollbar(stdout, @as(usize, cols), content_rows_with_margin, wrapped_count, first_row_to_show, max_scroll, top_margin + 1);
+        try stdout.print("\x1b[{d};1H", .{content_rows + 1});
 
         const cursor_col = try self.printInputArea(stdout, prompt, input_inner_cols, left_margin, max_prompt_rows);
         try stdout.print("{s}", .{theme.reset});
+
+        if (self.show_model_modal) {
+            try self.printModelModal(stdout, rows, cols);
+            try stdout.writeAll("\x1b[?25l");
+            return;
+        }
 
         const cursor_row = if (prompt_room_for_input == 0) 0 else self.cursor_pos / prompt_room_for_input;
         const first_visible_row = self.firstVisiblePromptInputRow(prompt_room_for_input, max_prompt_rows);
@@ -1894,14 +2117,16 @@ const App = struct {
         var printed: usize = 0;
         for (self.lines.items) |line| {
             const is_thinking = std.mem.startsWith(u8, line, thinking_marker);
+            const is_diff = !is_thinking and std.mem.startsWith(u8, line, diff_box_marker);
             const display_line = if (is_thinking) line[thinking_marker.len..] else line;
+            const display_without_marker = if (is_diff) display_line[diff_box_marker.len..] else display_line;
 
             // Detect user message at conversation level (like thinking)
-            const is_user_message = !is_thinking and std.mem.startsWith(u8, display_line, user_marker);
-            const user_content = if (is_user_message) display_line[user_marker.len..] else display_line;
+            const is_user_message = !is_diff and !is_thinking and std.mem.startsWith(u8, display_without_marker, user_marker);
+            const user_content = if (is_user_message) display_without_marker[user_marker.len..] else display_without_marker;
 
-            const effective_line = if (is_user_message) user_content else display_line;
-            const row_cols = rowContentCols(inner_cols, is_user_message, is_thinking);
+            const effective_line = if (is_user_message) user_content else display_without_marker;
+            const row_cols = rowContentCols(inner_cols, is_user_message, is_thinking, is_diff);
             const line_rows = wrappedRows(effective_line.len, row_cols);
 
             if (skipped + line_rows <= start_row) {
@@ -1913,6 +2138,8 @@ const App = struct {
                 if (printed < max_rows and skipped >= start_row) {
                     if (is_user_message) {
                         try self.printUserRowWithMargin(stdout, "", left_margin, true);
+                    } else if (is_diff) {
+                        try self.printDiffBoxRowWithMargin(stdout, "", left_margin);
                     } else if (is_thinking) {
                         try self.printThinkingRowWithMargin(stdout, "", left_margin);
                     } else {
@@ -1937,6 +2164,8 @@ const App = struct {
                 if (is_user_message) {
                     // First row of user message gets border, continuation rows don't
                     try self.printUserRowWithMargin(stdout, chunk, left_margin, local_row == 0);
+                } else if (is_diff) {
+                    try self.printDiffBoxRowWithMargin(stdout, chunk, left_margin);
                 } else if (is_thinking) {
                     try self.printThinkingRowWithMargin(stdout, chunk, left_margin);
                 } else {
@@ -1971,19 +2200,112 @@ const App = struct {
         }
     }
 
+    fn printModelModal(self: *App, stdout: anytype, rows: usize, cols: usize) !void {
+        if (rows < 8 or cols < 24) return;
+
+        const width: usize = @min(if (cols > 72) 64 else cols - 4, cols - 2);
+        const height: usize = @min(if (rows > 18) 14 else rows - 4, rows - 2);
+        const left = (cols - width) / 2 + 1;
+        const top = (rows - height) / 2 + 1;
+        const inner_width = width;
+        const text_width = inner_width - 4;
+        const content_top = top + model_modal_vertical_padding;
+        const help_row = top + height - model_modal_vertical_padding - 1;
+        const list_rows = if (height > model_modal_vertical_padding * 2 + 3) height - model_modal_vertical_padding * 2 - 3 else 1;
+
+        try self.printModalBackdrop(stdout, rows, cols);
+        try self.printModalPanel(stdout, top, left, width, height);
+        try self.printModalText(stdout, content_top, left, width, "Ollama Models", theme.mocha.mauve, false);
+        try self.printModalText(stdout, content_top + 1, left, width, "", theme.mocha.text, false);
+
+        if (self.model_error) |message| {
+            try self.printModalText(stdout, content_top + 2, left, width, message[0..@min(message.len, text_width)], theme.mocha.red, false);
+            var row: usize = 1;
+            while (row < list_rows) : (row += 1) {
+                try self.printModalText(stdout, content_top + 2 + row, left, width, "", theme.mocha.text, false);
+            }
+        } else if (self.model_names) |names| {
+            if (names.len == 0) {
+                try self.printModalText(stdout, content_top + 2, left, width, "No local models found", theme.mocha.subtext0, false);
+                var row: usize = 1;
+                while (row < list_rows) : (row += 1) {
+                    try self.printModalText(stdout, content_top + 2 + row, left, width, "", theme.mocha.text, false);
+                }
+            } else {
+                const first_visible = if (self.model_selected >= list_rows) self.model_selected - list_rows + 1 else 0;
+                var row: usize = 0;
+                while (row < list_rows) : (row += 1) {
+                    const index = first_visible + row;
+                    if (index < names.len) {
+                        const selected = index == self.model_selected;
+                        const active = std.mem.eql(u8, names[index], self.cfg.model);
+                        const model_color = if (active) theme.mocha.blue else if (selected) theme.mocha.text else theme.mocha.subtext0;
+                        try self.printModalText(stdout, content_top + 2 + row, left, width, names[index][0..@min(names[index].len, text_width - 2)], model_color, selected);
+                    } else {
+                        try self.printModalText(stdout, content_top + 2 + row, left, width, "", theme.mocha.text, false);
+                    }
+                }
+            }
+        } else {
+            try self.printModalText(stdout, content_top + 2, left, width, "Loading...", theme.mocha.subtext0, false);
+            var row: usize = 1;
+            while (row < list_rows) : (row += 1) {
+                try self.printModalText(stdout, content_top + 2 + row, left, width, "", theme.mocha.text, false);
+            }
+        }
+
+        try self.printModalText(stdout, help_row, left, width, "arrows/j/k move, Enter/Esc/q closes", theme.mocha.surface0, false);
+    }
+
+    fn printModalBackdrop(_: *App, stdout: anytype, rows: usize, cols: usize) !void {
+        var row: usize = 1;
+        while (row <= rows) : (row += 1) {
+            try stdout.print("\x1b[{d};1H{s}", .{ row, theme.mocha.crust_bg });
+            try stdout.splatByteAll(' ', cols);
+        }
+    }
+
+    fn printModalPanel(_: *App, stdout: anytype, top: usize, left: usize, width: usize, height: usize) !void {
+        var row: usize = 0;
+        while (row < height) : (row += 1) {
+            try stdout.print("\x1b[{d};1H{s}", .{ top + row, theme.mocha.crust_bg });
+            if (left > 1) try stdout.splatByteAll(' ', left - 1);
+            try stdout.print("{s}", .{theme.mocha.mantle_bg});
+            try stdout.splatByteAll(' ', width);
+            try stdout.print("{s}\x1b[K{s}", .{ theme.mocha.crust_bg, theme.reset });
+        }
+    }
+
+    fn printModalText(_: *App, stdout: anytype, row: usize, left: usize, width: usize, text: []const u8, color: []const u8, selected: bool) !void {
+        const inner_width = width;
+        const prefix = if (selected) "> " else "  ";
+        const available = inner_width - model_modal_padding * 2 - prefix.len;
+        const visible = text[0..@min(text.len, available)];
+        const used = model_modal_padding + prefix.len + visible.len;
+
+        try stdout.print("\x1b[{d};1H{s}", .{ row, theme.mocha.crust_bg });
+        if (left > 1) try stdout.splatByteAll(' ', left - 1);
+        try stdout.print("{s}", .{theme.mocha.mantle_bg});
+        try stdout.splatByteAll(' ', model_modal_padding);
+        try stdout.print("{s}{s}{s}", .{ prefix, color, visible });
+        if (used < inner_width) try stdout.splatByteAll(' ', inner_width - used);
+        try stdout.print("{s}\x1b[K{s}", .{ theme.mocha.crust_bg, theme.reset });
+    }
+
     fn countWrappedRows(self: *App, inner_cols: usize) usize {
         var total: usize = 0;
         for (self.lines.items) |line| {
             const is_thinking = std.mem.startsWith(u8, line, thinking_marker);
             const is_user = !is_thinking and std.mem.startsWith(u8, line, user_marker);
-            const display = if (is_thinking) line[thinking_marker.len..] else if (is_user) line[user_marker.len..] else line;
-            total += wrappedRows(display.len, rowContentCols(inner_cols, is_user, is_thinking));
+            const is_diff = !is_thinking and std.mem.startsWith(u8, line, diff_box_marker);
+            const display = if (is_thinking) line[thinking_marker.len..] else if (is_diff) line[diff_box_marker.len..] else if (is_user) line[user_marker.len..] else line;
+            total += wrappedRows(display.len, rowContentCols(inner_cols, is_user, is_thinking, is_diff));
         }
         return total;
     }
 
-    fn rowContentCols(inner_cols: usize, is_user: bool, is_thinking: bool) usize {
-        const reserved: usize = if (is_user or is_thinking) 2 else 2;
+    fn rowContentCols(inner_cols: usize, is_user: bool, is_thinking: bool, is_diff: bool) usize {
+        const reserved: usize = if (is_user or is_thinking or is_diff) 2 else 2;
         return if (inner_cols > reserved) inner_cols - reserved else 1;
     }
 
@@ -2036,7 +2358,6 @@ const App = struct {
     }
 
     fn printInputArea(self: *App, stdout: anytype, prompt: []const u8, inner_cols: usize, left_margin: usize, max_input_rows: usize) !usize {
-        _ = prompt;
         const border_cols: usize = 1;
         const input_left_padding: usize = 1;
         const input_right_padding: usize = 1;
@@ -2052,7 +2373,16 @@ const App = struct {
             theme.mocha.lavender,
             theme.mocha.surface0_bg,
         });
-        if (border_cols < inner_cols) try stdout.splatByteAll(' ', inner_cols - border_cols);
+        const prompt_text = std.mem.trim(u8, prompt, " \t\r\n");
+        if (prompt_text.len > 0) {
+            const available = if (inner_cols > border_cols + 2) inner_cols - border_cols - 2 else 0;
+            const shown = prompt_text[0..@min(prompt_text.len, available)];
+            try stdout.print(" {s}{s}{s}", .{ theme.mocha.subtext0, shown, theme.mocha.surface0_bg });
+            const used = border_cols + 1 + shown.len;
+            if (used < inner_cols) try stdout.splatByteAll(' ', inner_cols - used);
+        } else {
+            if (border_cols < inner_cols) try stdout.splatByteAll(' ', inner_cols - border_cols);
+        }
         try stdout.print("{s}\x1b[K{s}\n", .{ theme.mocha.mantle_bg, theme.reset });
 
         var input_row: usize = 0;
@@ -2139,6 +2469,13 @@ const App = struct {
         try stdout.print("{s}▌{s} {s}{s}", .{ theme.mocha.lavender, theme.mocha.surface0_bg, theme.mocha.text, text });
         // Fill rest of line with surface0 background
         try stdout.print("\x1b[K{s}\n", .{theme.reset});
+    }
+
+    fn printDiffBoxRowWithMargin(self: *App, stdout: anytype, text: []const u8, left_margin: usize) !void {
+        _ = self;
+        try stdout.print("{s}", .{theme.mocha.mantle_bg});
+        try stdout.splatByteAll(' ', left_margin);
+        try stdout.print("{s}▌{s} {s}{s}\x1b[K{s}\n", .{ theme.mocha.lavender, theme.mocha.surface0_bg, theme.mocha.text, text, theme.reset });
     }
 
     fn printThinkingRowWithMargin(self: *App, stdout: anytype, text: []const u8, left_margin: usize) !void {
@@ -2292,6 +2629,10 @@ fn styleMarkdownLine(allocator: std.mem.Allocator, line: []const u8) ![]u8 {
     }
 
     return out.toOwnedSlice(allocator);
+}
+
+fn sleepAfterInputError() void {
+    std.Io.sleep(std.Options.debug_io, std.Io.Duration.fromMilliseconds(50), .awake) catch {};
 }
 
 fn wrappedRows(line_len: usize, width: usize) usize {
