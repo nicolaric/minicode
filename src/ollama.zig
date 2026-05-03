@@ -33,6 +33,97 @@ pub const StreamChunk = struct {
     done: bool,
 };
 
+pub fn listModels(allocator: std.mem.Allocator, cfg: config.Config) ![][]u8 {
+    const url = try std.fmt.allocPrint(allocator, "{s}/api/tags", .{cfg.base_url});
+    defer allocator.free(url);
+
+    const argv = [_][]const u8{ "curl", "-s", "--fail", url };
+    var child = try std.process.spawn(std.Options.debug_io, .{
+        .argv = &argv,
+        .stdout = .pipe,
+        .stderr = .ignore,
+    });
+
+    var response_body = std.ArrayList(u8).empty;
+    errdefer response_body.deinit(allocator);
+    if (child.stdout) |stdout_file| {
+        var buf: [4096]u8 = undefined;
+        while (true) {
+            var vecs = [_][]u8{buf[0..]};
+            const n = stdout_file.readStreaming(std.Options.debug_io, &vecs) catch break;
+            if (n == 0) break;
+            try response_body.appendSlice(allocator, buf[0..n]);
+        }
+    }
+
+    const term = try child.wait(std.Options.debug_io);
+    switch (term) {
+        .exited => |code| if (code != 0) return error.OllamaError,
+        else => return error.OllamaError,
+    }
+    defer response_body.deinit(allocator);
+
+    const parsed = try std.json.parseFromSlice(std.json.Value, allocator, response_body.items, .{});
+    defer parsed.deinit();
+
+    const root = parsed.value.object;
+    const models_value = root.get("models") orelse return error.InvalidOllamaResponse;
+    if (models_value != .array) return error.InvalidOllamaResponse;
+
+    var names = std.ArrayList([]u8).empty;
+    errdefer {
+        for (names.items) |name| allocator.free(name);
+        names.deinit(allocator);
+    }
+
+    for (models_value.array.items) |model_value| {
+        if (model_value != .object) continue;
+        const name_value = model_value.object.get("name") orelse continue;
+        if (name_value != .string or name_value.string.len == 0) continue;
+        try names.append(allocator, try allocator.dupe(u8, name_value.string));
+    }
+
+    return try names.toOwnedSlice(allocator);
+}
+
+pub fn freeModels(allocator: std.mem.Allocator, models: [][]u8) void {
+    for (models) |model| allocator.free(model);
+    allocator.free(models);
+}
+
+pub fn preloadModel(allocator: std.mem.Allocator, cfg: config.Config) !void {
+    if (cfg.model.len == 0) return;
+
+    var body = std.Io.Writer.Allocating.init(allocator);
+    defer body.deinit();
+    try body.writer.writeAll("{\"model\":");
+    try std.json.Stringify.value(cfg.model, .{}, &body.writer);
+    try body.writer.writeAll(",\"prompt\":\"\",\"stream\":false,\"keep_alive\":\"30m\"}");
+
+    const url = try std.fmt.allocPrint(allocator, "{s}/api/generate", .{cfg.base_url});
+    defer allocator.free(url);
+
+    const argv = [_][]const u8{
+        "curl",
+        "-s",
+        "--fail",
+        "-X", "POST",
+        "-H", "Content-Type: application/json",
+        "-d", body.written(),
+        url,
+    };
+    var child = try std.process.spawn(std.Options.debug_io, .{
+        .argv = &argv,
+        .stdout = .ignore,
+        .stderr = .ignore,
+    });
+    const term = try child.wait(std.Options.debug_io);
+    switch (term) {
+        .exited => |code| if (code != 0) return error.OllamaError,
+        else => return error.OllamaError,
+    }
+}
+
 pub fn freeToolCalls(allocator: std.mem.Allocator, calls: []ToolCall) void {
     for (calls) |call| freeToolCall(allocator, call);
     allocator.free(calls);
