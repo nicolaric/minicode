@@ -5,6 +5,56 @@ const syntax_highlight = @import("syntax_highlight.zig");
 
 const testing = std.testing;
 
+fn getEnvVar(name: []const u8) ?[]const u8 {
+    var i: usize = 0;
+    while (std.c.environ[i]) |ptr| : (i += 1) {
+        const env_str = std.mem.sliceTo(ptr, 0);
+        if (std.mem.startsWith(u8, env_str, name) and env_str.len > name.len and env_str[name.len] == '=') {
+            return env_str[name.len + 1 ..];
+        }
+    }
+    return null;
+}
+
+fn loadShellEnv(allocator: std.mem.Allocator, shell: []const u8) !std.process.Environ.Map {
+    var env_map = std.process.Environ.Map.init(allocator);
+    errdefer env_map.deinit();
+
+    const argv = [_][]const u8{ shell, "-lic", "env" };
+    var child = try std.process.spawn(std.Options.debug_io, .{
+        .argv = &argv,
+        .stdin = .ignore,
+        .stdout = .pipe,
+        .stderr = .ignore,
+    });
+    defer _ = child.wait(std.Options.debug_io) catch {};
+
+    var output = std.ArrayList(u8).empty;
+    defer output.deinit(allocator);
+
+    if (child.stdout) |stdout_file| {
+        var buf: [4096]u8 = undefined;
+        while (true) {
+            var vecs = [_][]u8{buf[0..]};
+            const n = stdout_file.readStreaming(std.Options.debug_io, &vecs) catch break;
+            if (n == 0) break;
+            try output.appendSlice(allocator, buf[0..n]);
+        }
+    }
+
+    var lines = std.mem.splitScalar(u8, output.items, '\n');
+    while (lines.next()) |line| {
+        if (line.len == 0) continue;
+        const equals = std.mem.indexOfScalar(u8, line, '=') orelse continue;
+        if (equals == 0) continue;
+        const key = line[0..equals];
+        const value = line[equals + 1 ..];
+        try env_map.put(key, value);
+    }
+
+    return env_map;
+}
+
 pub const ToolRequest = struct {
     tool: []const u8,
     args: std.json.Value,
@@ -304,6 +354,79 @@ test "write_file creates a file" {
     try testing.expectEqualStrings("hello\n", content);
 }
 
+test "run_shell blocks zig build run" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const allocator = arena.allocator();
+
+    var args = try std.json.ObjectMap.init(allocator, &.{}, &.{});
+    try args.put(allocator, "command", .{ .string = "zig build run" });
+
+    const result = try execute(allocator, .{ .tool = "run_shell", .args = .{ .object = args } }, null);
+    try testing.expect(std.mem.indexOf(u8, result, "interactive command blocked in run_shell") != null);
+    try testing.expect(std.mem.indexOf(u8, result, "Use 'zig build' instead.") != null);
+}
+
+test "run_shell blocks zig build run with extra args" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const allocator = arena.allocator();
+
+    var args = try std.json.ObjectMap.init(allocator, &.{}, &.{});
+    try args.put(allocator, "command", .{ .string = "zig build run -- foo" });
+
+    const result = try execute(allocator, .{ .tool = "run_shell", .args = .{ .object = args } }, null);
+    try testing.expect(std.mem.indexOf(u8, result, "interactive command blocked in run_shell") != null);
+}
+
+test "run_shell blocks nested minicode binary path" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const allocator = arena.allocator();
+
+    var args = try std.json.ObjectMap.init(allocator, &.{}, &.{});
+    try args.put(allocator, "command", .{ .string = "./zig-out/bin/minicode --help" });
+
+    const result = try execute(allocator, .{ .tool = "run_shell", .args = .{ .object = args } }, null);
+    try testing.expect(std.mem.indexOf(u8, result, "interactive command blocked in run_shell") != null);
+}
+
+test "run_shell blocks direct minicode token" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const allocator = arena.allocator();
+
+    var args = try std.json.ObjectMap.init(allocator, &.{}, &.{});
+    try args.put(allocator, "command", .{ .string = "minicode --help" });
+
+    const result = try execute(allocator, .{ .tool = "run_shell", .args = .{ .object = args } }, null);
+    try testing.expect(std.mem.indexOf(u8, result, "interactive command blocked in run_shell") != null);
+}
+
+test "run_shell allows safe non-interactive command" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const allocator = arena.allocator();
+
+    var args = try std.json.ObjectMap.init(allocator, &.{}, &.{});
+    try args.put(allocator, "command", .{ .string = "pwd" });
+
+    const result = try execute(allocator, .{ .tool = "run_shell", .args = .{ .object = args } }, null);
+    try testing.expect(std.mem.indexOf(u8, result, "interactive command blocked in run_shell") == null);
+}
+
+test "run_shell allows echoing minicode path as text" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const allocator = arena.allocator();
+
+    var args = try std.json.ObjectMap.init(allocator, &.{}, &.{});
+    try args.put(allocator, "command", .{ .string = "echo ./zig-out/bin/minicode" });
+
+    const result = try execute(allocator, .{ .tool = "run_shell", .args = .{ .object = args } }, null);
+    try testing.expect(std.mem.indexOf(u8, result, "interactive command blocked in run_shell") == null);
+}
+
 test "grep searches a single file path" {
     var arena = std.heap.ArenaAllocator.init(testing.allocator);
     defer arena.deinit();
@@ -511,17 +634,14 @@ test "glob excludes .gitignore matches" {
 
 test "glob recursive excludes ignored directories" {
     const base_dir = ".tmp-glob-excluded-dirs";
-    std.Io.Dir.cwd().deleteTree(std.Options.debug_io, base_dir) catch |err| switch (err) {
-        error.FileNotFound => {},
-        else => return err,
-    };
+    std.Io.Dir.cwd().deleteTree(std.Options.debug_io, base_dir) catch {};
     defer std.Io.Dir.cwd().deleteTree(std.Options.debug_io, base_dir) catch {};
 
-    try std.Io.Dir.cwd().makePath(std.Options.debug_io, base_dir ++ std.fs.path.sep_str ++ "ok");
-    try std.Io.Dir.cwd().makePath(std.Options.debug_io, base_dir ++ std.fs.path.sep_str ++ ".git");
-    try std.Io.Dir.cwd().makePath(std.Options.debug_io, base_dir ++ std.fs.path.sep_str ++ ".zig-cache");
-    try std.Io.Dir.cwd().makePath(std.Options.debug_io, base_dir ++ std.fs.path.sep_str ++ "zig-pkg");
-    try std.Io.Dir.cwd().makePath(std.Options.debug_io, base_dir ++ std.fs.path.sep_str ++ "zig-out");
+    try std.Io.Dir.cwd().createDirPath(std.Options.debug_io, base_dir ++ std.fs.path.sep_str ++ "ok");
+    try std.Io.Dir.cwd().createDirPath(std.Options.debug_io, base_dir ++ std.fs.path.sep_str ++ ".git");
+    try std.Io.Dir.cwd().createDirPath(std.Options.debug_io, base_dir ++ std.fs.path.sep_str ++ ".zig-cache");
+    try std.Io.Dir.cwd().createDirPath(std.Options.debug_io, base_dir ++ std.fs.path.sep_str ++ "zig-pkg");
+    try std.Io.Dir.cwd().createDirPath(std.Options.debug_io, base_dir ++ std.fs.path.sep_str ++ "zig-out");
 
     {
         var file = try std.Io.Dir.cwd().createFile(std.Options.debug_io, base_dir ++ std.fs.path.sep_str ++ "ok" ++ std.fs.path.sep_str ++ "keep.zig", .{});
@@ -849,18 +969,21 @@ fn runShell(allocator: std.mem.Allocator, command: []const u8, confirmer: ?Confi
         }
     }
 
-    var argv = std.ArrayList([]const u8).empty;
-    defer argv.deinit(allocator);
-
-    var it = std.mem.splitScalar(u8, command, ' ');
-    while (it.next()) |arg| {
-        if (arg.len > 0) try argv.append(allocator, arg);
+    if (std.mem.trim(u8, command, " \t\r\n").len == 0) return std.fmt.allocPrint(allocator, "Error: empty command", .{});
+    if (isInteractiveOrNestedMinicodeCommand(command)) {
+        return std.fmt.allocPrint(allocator, "Error: interactive command blocked in run_shell: {s}. Use 'zig build' instead.", .{command});
     }
 
-    if (argv.items.len == 0) return std.fmt.allocPrint(allocator, "Error: empty command", .{});
+    const shell = getEnvVar("SHELL") orelse "/bin/sh";
+    const argv = [_][]const u8{ shell, "-lc", command };
+    var shell_env = loadShellEnv(allocator, shell) catch null;
+    defer if (shell_env) |*env| env.deinit();
+    const environ_map: ?*std.process.Environ.Map = if (shell_env) |*env| env else null;
 
     var child = std.process.spawn(std.Options.debug_io, .{
-        .argv = argv.items,
+        .argv = &argv,
+        .environ_map = environ_map,
+        .stdin = .ignore,
         .stdout = .pipe,
         .stderr = .pipe,
     }) catch |err| {
@@ -895,6 +1018,32 @@ fn runShell(allocator: std.mem.Allocator, command: []const u8, confirmer: ?Confi
     }
 
     return output.toOwnedSlice(allocator);
+}
+
+fn isInteractiveOrNestedMinicodeCommand(command: []const u8) bool {
+    const trimmed = std.mem.trim(u8, command, " \t\r\n");
+    if (trimmed.len == 0) return false;
+
+    var tokens = std.mem.tokenizeAny(u8, trimmed, " \t\r\n");
+
+    const first = tokens.next() orelse return false;
+    const second = tokens.next();
+    const third = tokens.next();
+
+    if (std.mem.eql(u8, first, "zig") and
+        second != null and std.mem.eql(u8, second.?, "build") and
+        third != null and std.mem.eql(u8, third.?, "run"))
+    {
+        return true;
+    }
+
+    return isMinicodeToken(first);
+}
+
+fn isMinicodeToken(token: []const u8) bool {
+    if (token.len == 0) return false;
+    if (std.mem.eql(u8, token, "minicode")) return true;
+    return std.mem.endsWith(u8, token, "/minicode");
 }
 
 /// Find files matching a glob pattern (e.g., "**/*.zig" or "src/**/*.zig")
