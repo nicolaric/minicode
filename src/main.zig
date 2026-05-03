@@ -14,6 +14,7 @@ pub fn main() !void {
     app_threaded_io = std.Io.Threaded.init(std.heap.smp_allocator, .{});
     defer app_threaded_io.deinit();
 
-    const cfg = config.load();
-    try tui.run(allocator, cfg);
+    var loaded_config = try config.load(allocator);
+    defer loaded_config.deinit(allocator);
+    try tui.run(allocator, loaded_config.config);
 }

@@ -38,6 +38,17 @@ Override them when needed:
 OLLAMA_BASE_URL=http://127.0.0.1:11434 OLLAMA_MODEL=qwen3.6:27b-coding-nvfp4 zig build run
 ```
 
+You can also set defaults in `~/.config/minicode/config.json`:
+
+```json
+{
+  "model": "qwen3.6:27b-coding-nvfp4",
+  "base_url": "http://127.0.0.1:11434"
+}
+```
+
+Environment variables take precedence over the config file.
+
 Syntax highlighting is enabled by default. Set `NIC_SYNTAX_HIGHLIGHTING` to a truthy value (`true`, `1`, or `yes`) to enable it explicitly; any other value disables it.
 
 ## Build and run
