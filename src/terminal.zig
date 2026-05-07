@@ -31,14 +31,14 @@ pub const Terminal = struct {
         try std.posix.tcsetattr(stdin_fd, .FLUSH, raw);
         errdefer std.posix.tcsetattr(stdin_fd, .FLUSH, original) catch {};
 
-        try std.Io.File.writeStreamingAll(std.Io.File.stdout(), std.Options.debug_io, "\x1b[?1049h\x1b[?1007h\x1b[?25l\x1b[2J\x1b[H");
+        try std.Io.File.writeStreamingAll(std.Io.File.stdout(), std.Options.debug_io, "\x1b[?1049h\x1b[?1007h\x1b[?2004h\x1b[?25l\x1b[2J\x1b[H");
 
         return .{ .stdin_fd = stdin_fd, .original = original, .original_pgrp = original_pgrp };
     }
 
     pub fn leave(self: *Terminal) void {
         std.posix.tcsetattr(self.stdin_fd, .FLUSH, self.original) catch {};
-        std.Io.File.writeStreamingAll(std.Io.File.stdout(), std.Options.debug_io, "\x1b[0m\x1b[?1007l\x1b[?25h\x1b[?1049l") catch {};
+        std.Io.File.writeStreamingAll(std.Io.File.stdout(), std.Options.debug_io, "\x1b[0m\x1b[?1007l\x1b[?2004l\x1b[?25h\x1b[?1049l") catch {};
         if (self.original_pgrp) |pgrp| restoreForeground(self.stdin_fd, pgrp);
     }
 };
