@@ -1,7 +1,7 @@
 .{
     .name = .minicode,
     .version = "0.1.1",
-    .fingerprint = 0x1a2372d2b0b727a3,
+    .fingerprint = 0xc06ff7a7030f7442,
     .dependencies = .{
         .flow_syntax = .{
             .url = "git+https://github.com/neurocyte/flow-syntax#master",
