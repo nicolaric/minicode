@@ -2,7 +2,17 @@
 
 `minicode` is a minimal local coding agent written in Zig. It runs in a full-screen terminal UI, chats with a local Ollama model, streams responses, and lets the model request a small set of file and shell tools through JSON tool calls.
 
-The repository/package name is currently `nic_agent`, but the executable and Zig build target are `minicode`.
+## Installation
+
+### Homebrew
+
+```bash
+brew install nicolascavallin/tap/minicode
+```
+
+### Build from source
+
+See [Prerequisites](#prerequisites) and [Build and run](#build-and-run) sections below.
 
 ## Prerequisites
 

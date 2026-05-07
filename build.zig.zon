@@ -1,5 +1,5 @@
 .{
-    .name = .nic_agent,
+    .name = .minicode,
     .version = "0.1.1",
     .fingerprint = 0x1a2372d2b0b727a3,
     .dependencies = .{
