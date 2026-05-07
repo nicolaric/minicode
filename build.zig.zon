@@ -5,7 +5,7 @@
     .dependencies = .{
         .flow_syntax = .{
             .url = "git+https://github.com/neurocyte/flow-syntax#0d8837fce134fb02c37d844d1d306cdbd44cef87",
-            .hash = "flow_syntax-0.7.2-X8jOoexkAQAJv_Qo4HwkJxwnjuvnc5b9i4DgcsbIIbvb",
+            .hash = "flow_syntax-0.7.2-X8jOoexkAQAzt0txlbKcoIbjaJyKZTHFFR5-iA3oO5if",
         },
     },
     .paths = .{
