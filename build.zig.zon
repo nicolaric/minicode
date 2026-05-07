@@ -1,11 +1,11 @@
 .{
     .name = .nic_agent,
-    .version = "0.1.0",
+    .version = "0.1.1",
     .fingerprint = 0x1a2372d2b0b727a3,
     .dependencies = .{
         .flow_syntax = .{
             .url = "git+https://github.com/neurocyte/flow-syntax#master",
-            .hash = "flow_syntax-0.7.2-X8jOoZJcAQDG_jcA_FMqGZ98xjrrq7W-GscGocAKzfsM",
+            .hash = "flow_syntax-0.7.2-X8jOoexkAQAJv_Qo4HwkJxwnjuvnc5b9i4DgcsbIIbvb",
         },
     },
     .paths = .{
