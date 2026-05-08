@@ -7,7 +7,7 @@
 ### Homebrew
 
 ```bash
-brew install nicolascavallin/tap/minicode
+brew install nicolaric/tap/minicode
 ```
 
 ### Build from source
