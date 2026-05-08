@@ -21,15 +21,11 @@ The `ContextTracker` (in `src/context_tracker.zig`) monitors the agent's progres
    - Project type is inferred from file extensions (e.g., `.zig`, `.rs`, `Cargo.toml`)
    - Files touched are tracked (unique paths)
    - Key discoveries are captured (grep results, file modifications)
-3. **Summary generation**: After every 4 rounds, a narrative summary is generated:
-   ```
-   📋 Context Summary:
-   - Zig project
-   - Can be built with: zig build
-   - Looking for 'config'
-   - Working on file: main.zig
-   - Looking to implement feature X
-   ```
+3. **Incremental summary generation**: After every 4 rounds, a minimal delta summary is generated. The tracker stores its previous output and only emits new/changed items:
+   - Project info (only on first summary)
+   - New discoveries since last report
+   - Changed intent
+   - Returns `null` if nothing new to report
 4. **UI display**: The summary appears in the conversation as a system message
 
 ### Integration Points

@@ -119,8 +119,8 @@ pub fn printModelModal(self: *App, stdout: anytype, rows: usize, cols: usize) !v
                 if (index < names.len) {
                     const selected = index == self.model_selected;
                     const active = std.mem.eql(u8, names[index], self.cfg.model);
-                    const model_color = if (active) theme.mocha.blue else if (selected) theme.mocha.text else theme.mocha.subtext0;
-                    try printModalText(stdout, content_top + 2 + row, left, width, names[index][0..@min(names[index].len, text_width - 2)], model_color, selected);
+                    const model_color = if (selected) theme.mocha.surface0 else if (active) theme.mocha.blue else theme.mocha.subtext0;
+                    try printModalText(stdout, content_top + 2 + row, left, width, names[index][0..@min(names[index].len, text_width)], model_color, selected);
                 } else {
                     try printModalText(stdout, content_top + 2 + row, left, width, "", theme.mocha.text, false);
                 }
@@ -161,60 +161,93 @@ fn printModalPanel(stdout: anytype, top: usize, left: usize, width: usize, heigh
 /// Print modal text line
 fn printModalText(stdout: anytype, row: usize, left: usize, width: usize, text: []const u8, color: []const u8, selected: bool) !void {
     const inner_width = width;
-    const prefix = if (selected) "> " else "  ";
-    const available = inner_width - utils.model_modal_padding * 2 - prefix.len;
+    const available = inner_width - utils.model_modal_padding * 2;
     const visible = text[0..@min(text.len, available)];
-    const used = utils.model_modal_padding + prefix.len + visible.len;
+    const used = utils.model_modal_padding + visible.len;
+    const bg = if (selected) theme.mocha.lavender_bg else theme.mocha.mantle_bg;
 
     try stdout.print("\x1b[{d};1H{s}", .{ row, theme.mocha.crust_bg });
     if (left > 1) try stdout.splatByteAll(' ', left - 1);
-    try stdout.print("{s}", .{theme.mocha.mantle_bg});
+    try stdout.print("{s}", .{bg});
     try stdout.splatByteAll(' ', utils.model_modal_padding);
-    try stdout.print("{s}{s}{s}", .{ prefix, color, visible });
+    try stdout.print("{s}{s}", .{ color, visible });
+    try stdout.print("{s}", .{bg});
     if (used < inner_width) try stdout.splatByteAll(' ', inner_width - used);
     try stdout.print("{s}\x1b[K{s}", .{ theme.mocha.crust_bg, theme.reset });
 }
 
+/// Print command palette text line using the same background as the input box.
+fn printCommandPaletteText(stdout: anytype, row: usize, left: usize, width: usize, text: []const u8, color: []const u8, selected: bool) !void {
+    const inner_width = width;
+    const available = inner_width - utils.model_modal_padding * 2;
+    const visible = text[0..@min(text.len, available)];
+    const used = utils.model_modal_padding + visible.len;
+    const bg = if (selected) theme.mocha.lavender_bg else theme.mocha.surface0_bg;
+
+    try stdout.print("\x1b[{d};1H{s}", .{ row, theme.mocha.mantle_bg });
+    if (left > 1) try stdout.splatByteAll(' ', left - 1);
+    try stdout.print("{s}", .{bg});
+    try stdout.splatByteAll(' ', utils.model_modal_padding);
+    try stdout.print("{s}{s}", .{ color, visible });
+    try stdout.print("{s}", .{bg});
+    if (used < inner_width) try stdout.splatByteAll(' ', inner_width - used);
+    try stdout.print("{s}\x1b[K{s}", .{ theme.mocha.mantle_bg, theme.reset });
+}
 
 /// Print the command palette dropup (above input area)
 pub fn printCommandPalette(self: *App, stdout: anytype, rows: usize, cols: usize) !void {
-    const commands = [_][]const u8{
-        "/new",
-        "/model",
-        "/exit",
-    };
-    const count = commands.len;
-    const palette_height = count + 2; // title + items + help
+    const palette_height = count + 1; // items + help
 
     // Position: above the input area, at the bottom of the screen
-    const top = @max(@as(usize, 1), rows - palette_height - 1);
+    const top = @max(@as(usize, 1), rows - palette_height - 2);
     const width: usize = @min(40, cols - 2);
     const left = (cols - width) / 2 + 1;
+
+    try printCommandPaletteAt(self, stdout, top, left, width);
+}
+
+const commands = app_mod.command_palette_commands;
+const count = commands.len;
+
+fn commandFilter(self: *App) []const u8 {
+    const trimmed = std.mem.trim(u8, self.input.items, " \t\r\n");
+    return if (trimmed.len > 0 and trimmed[0] == '/') trimmed else "/";
+}
+
+fn commandMatches(command: []const u8, filter: []const u8) bool {
+    return filter.len <= 1 or (filter.len <= command.len and std.mem.startsWith(u8, command, filter));
+}
+
+/// Print the command palette at a specific terminal position.
+pub fn printCommandPaletteAt(self: *App, stdout: anytype, top: usize, left: usize, width: usize) !void {
+    const palette_height = count + 1; // items + help
 
     // Draw the palette box
     var row: usize = 0;
     while (row < palette_height) : (row += 1) {
-        try stdout.print("\x1b[{d};1H{s}", .{ top + row, theme.mocha.crust_bg });
+        try stdout.print("\x1b[{d};1H{s}", .{ top + row, theme.mocha.mantle_bg });
         if (left > 1) try stdout.splatByteAll(' ', left - 1);
-        try stdout.print("{s}", .{theme.mocha.mantle_bg});
+        try stdout.print("{s}", .{theme.mocha.surface0_bg});
         try stdout.splatByteAll(' ', width);
-        try stdout.print("{s}\x1b[K{s}", .{ theme.mocha.crust_bg, theme.reset });
-      }
+        try stdout.print("{s}\x1b[K{s}", .{ theme.mocha.mantle_bg, theme.reset });
+    }
 
-    // Title
-    try printModalText(stdout, top, left, width, "Commands", theme.mocha.mauve, false);
-
-    // Command items
+    const filter = commandFilter(self);
     var idx: usize = 0;
+    var visible: usize = 0;
     while (idx < count) : (idx += 1) {
         const cmd = commands[idx];
-        const selected = idx == self.command_selected;
-        const color = if (selected) theme.mocha.text else theme.mocha.subtext0;
-        const label = try std.fmt.allocPrint(std.heap.page_allocator, "{s} - {s}", .{ cmd[0], cmd[1] });
-        defer _ = std.heap.page_allocator.free(label);
-        try printModalText(stdout, top + 1 + idx, left, width, label, color, selected);
-      }
+        if (!commandMatches(cmd, filter)) continue;
+        const selected = visible == self.command_selected;
+        const color = if (selected) theme.mocha.surface0 else theme.mocha.subtext0;
+        try printCommandPaletteText(stdout, top + visible, left, width, cmd, color, selected);
+        visible += 1;
+    }
+
+    if (visible == 0) {
+        try printCommandPaletteText(stdout, top, left, width, "No commands match", theme.mocha.subtext0, false);
+    }
 
     // Help text
-    try printModalText(stdout, top + count + 1, left, width, "arrows/j/k move, Enter select, Esc/q close", theme.mocha.surface0, false);
+    try printCommandPaletteText(stdout, top + count, left, width, "type to filter, arrows move, Enter select, Esc close", theme.mocha.surface0, false);
 }

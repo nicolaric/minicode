@@ -30,6 +30,12 @@ pub const welcome_title_lines = [_][]const u8{
     "██      ██ ██ ██   ████ ██  ██████  ██████  ██████  ███████ ",
 };
 
+pub const command_palette_commands = [_][]const u8{
+    "/exit",
+    "/model",
+    "/new",
+};
+
 // Empty banner (can be customized)
 const minicode_banner = "";
 
@@ -255,12 +261,19 @@ pub const App = struct {
                 '/' => {
                     if (self.is_busy) continue;
                     const trimmed = std.mem.trim(u8, self.input.items, " \t\r\n");
-                    if (trimmed.len == 0) {
+                    if (trimmed.len == 0 and self.input.items.len < utils.max_input) {
+                        try self.input.insert(self.allocator, self.cursor_pos, '/');
+                        self.cursor_pos += 1;
                         self.show_command_palette = true;
                         self.command_selected = 0;
                         try self.render();
                         continue;
-                      }
+                    }
+                    if (self.input.items.len < utils.max_input) {
+                        try self.input.insert(self.allocator, self.cursor_pos, '/');
+                        self.cursor_pos += 1;
+                        try self.render();
+                    }
                 },
                 '\r', '\n' => {
                     if (self.pasting) {
@@ -290,6 +303,9 @@ pub const App = struct {
                         continue;
                     }
                     if (std.mem.eql(u8, trimmed, "/model")) {
+                        self.input.clearRetainingCapacity();
+                        self.cursor_pos = 0;
+                        self.input_cleared = false;
                         try self.openModelModal();
                         try self.render();
                         continue;
@@ -320,10 +336,10 @@ pub const App = struct {
                                 // Copy text before placeholder
                                 @memcpy(result[0..ph_start], trimmed[0..ph_start]);
                                 // Copy actual paste content
-                                @memcpy(result[ph_start..ph_start + paste_content.len], paste_content);
+                                @memcpy(result[ph_start .. ph_start + paste_content.len], paste_content);
                                 // Copy text after placeholder
                                 const after_placeholder = ph_start + end + 1;
-                                @memcpy(result[ph_start + paste_content.len..], trimmed[after_placeholder..]);
+                                @memcpy(result[ph_start + paste_content.len ..], trimmed[after_placeholder..]);
                                 break :blk result;
                             }
                         }
@@ -373,6 +389,12 @@ pub const App = struct {
                         _ = self.input.orderedRemove(self.cursor_pos - 1);
                         self.cursor_pos -= 1;
                     }
+                    {
+                        const trimmed = std.mem.trim(u8, self.input.items, " \t\r\n");
+                        if (self.show_command_palette and (trimmed.len == 0 or trimmed[0] != '/')) {
+                            self.closeCommandPalette();
+                        }
+                    }
                     try self.render();
                 },
                 27 => {
@@ -416,7 +438,7 @@ pub const App = struct {
                             '1' => {
                                 if (try input_mod.handleModifiedArrow(self, stdin)) try self.render();
                             },
-                                '2' => {
+                            '2' => {
                                 var seq3: [1]u8 = undefined;
                                 const n3 = stdin.readSliceShort(&seq3) catch 0;
                                 if (n3 == 0) continue;
@@ -507,6 +529,12 @@ pub const App = struct {
                         if (self.input.items.len < utils.max_input) {
                             try self.input.insert(self.allocator, self.cursor_pos, ch);
                             self.cursor_pos += 1;
+                            if (self.show_command_palette) {
+                                const trimmed = std.mem.trim(u8, self.input.items, " \t\r\n");
+                                if (trimmed.len == 0 or trimmed[0] != '/') {
+                                    self.closeCommandPalette();
+                                }
+                            }
                             try self.render();
                         }
                     }
@@ -593,6 +621,11 @@ pub const App = struct {
     }
 
     pub fn openModelModal(self: *App) !void {
+        self.show_command_palette = false;
+        self.command_selected = 0;
+        self.input.clearRetainingCapacity();
+        self.cursor_pos = 0;
+        self.input_cleared = false;
         self.clearModelModalData();
         self.show_model_modal = true;
         self.model_names = ollama.listModels(self.allocator, self.cfg) catch |err| blk: {
@@ -603,11 +636,19 @@ pub const App = struct {
 
     pub fn closeModelModal(self: *App) void {
         self.show_model_modal = false;
+        if (self.show_welcome) {
+            self.welcome_rendered = false;
+        }
     }
 
     pub fn closeCommandPalette(self: *App) void {
         self.show_command_palette = false;
-     }
+        // Force full redraw on welcome screen since palette overlaps with title/gap area
+        // and renderWelcomeInput doesn't clear rows above the input box
+        if (self.show_welcome) {
+            self.welcome_rendered = false;
+        }
+    }
 
     fn addSystemPrompt(self: *App) !void {
         try self.messages.append(self.allocator, .{ .role = .system, .content = try self.allocator.dupe(u8, agent.system_prompt) });
@@ -877,7 +918,8 @@ pub const App = struct {
                 first_line = false;
                 if (std.mem.startsWith(u8, line, "Edited ") or
                     std.mem.startsWith(u8, line, "Updated ") or
-                    std.mem.startsWith(u8, line, "Created ")) {
+                    std.mem.startsWith(u8, line, "Created "))
+                {
                     // Show status with left arrow icon, change "Edited" to "Edit"
                     var action: []const u8 = "Create";
                     var rest_start: usize = 8;
@@ -894,16 +936,16 @@ pub const App = struct {
                     continue;
                 }
             }
-            
+
             // Skip empty lines
             if (line.len == 0) continue;
-            
+
             // Add separator line after status before first diff content
             if (status_shown) {
                 try self.addLine(diff_box_marker, .{});
                 status_shown = false;
             }
-            
+
             // Diff output already contains ANSI color codes - don't sanitize them
             // Just ensure no harmful control characters
             const safe_line = try utils.sanitizeAnsiAlloc(self.allocator, line);
@@ -1249,6 +1291,12 @@ pub const App = struct {
                         self.cursor_pos -= 1;
                         needs_render = true;
                     }
+                    {
+                        const trimmed = std.mem.trim(u8, self.input.items, " \t\r\n");
+                        if (self.show_command_palette and (trimmed.len == 0 or trimmed[0] != '/')) {
+                            self.closeCommandPalette();
+                        }
+                    }
                 },
                 27 => {
                     if (try input_mod.handleBusyEscapeSequence(self)) needs_render = true;
@@ -1257,6 +1305,12 @@ pub const App = struct {
                     if (ch >= 32 and ch != 127 and self.input.items.len < utils.max_input) {
                         try self.input.insert(self.allocator, self.cursor_pos, ch);
                         self.cursor_pos += 1;
+                        if (self.show_command_palette) {
+                            const trimmed = std.mem.trim(u8, self.input.items, " \t\r\n");
+                            if (trimmed.len == 0 or trimmed[0] != '/') {
+                                self.closeCommandPalette();
+                            }
+                        }
                         needs_render = true;
                     }
                 },
@@ -1783,8 +1837,7 @@ pub const App = struct {
             return null;
         }
 
-        const summary = try self.tracker.generateSummary();
-        errdefer self.allocator.free(summary);
+        const summary = try self.tracker.generateSummary() orelse return null;
 
         // Add to UI
         try self.addLine("", .{});

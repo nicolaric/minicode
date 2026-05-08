@@ -4,6 +4,35 @@ const app_mod = @import("app.zig");
 
 const App = app_mod.App;
 
+fn commandFilter(self: *App) []const u8 {
+    const trimmed = std.mem.trim(u8, self.input.items, " \t\r\n");
+    return if (trimmed.len > 0 and trimmed[0] == '/') trimmed else "/";
+}
+
+fn commandMatches(command: []const u8, filter: []const u8) bool {
+    return filter.len <= 1 or (filter.len <= command.len and std.mem.startsWith(u8, command, filter));
+}
+
+fn matchingCommandCount(self: *App) usize {
+    const filter = commandFilter(self);
+    var visible: usize = 0;
+    for (app_mod.command_palette_commands) |command| {
+        if (commandMatches(command, filter)) visible += 1;
+    }
+    return visible;
+}
+
+fn nthMatchingCommandIndex(self: *App, selected: usize) ?usize {
+    const filter = commandFilter(self);
+    var visible: usize = 0;
+    for (app_mod.command_palette_commands, 0..) |command, idx| {
+        if (!commandMatches(command, filter)) continue;
+        if (visible == selected) return idx;
+        visible += 1;
+    }
+    return null;
+}
+
 /// Handle model modal key input
 pub fn handleModelModalKey(self: *App, stdin: anytype, ch: u8) !bool {
     switch (ch) {
@@ -54,7 +83,7 @@ pub fn handleModelModalKey(self: *App, stdin: anytype, ch: u8) !bool {
         'j' => {
             if (self.model_selected + 1 < count) self.model_selected += 1;
         },
-        else => return false,
+        else => return true,
     }
     try self.render();
     return true;
@@ -262,8 +291,7 @@ pub fn handleSgrMouse(self: *App, stdin: anytype) !bool {
 
 /// Handle command palette key input
 pub fn handleCommandPaletteKey(self: *App, stdin: anytype, ch: u8) !bool {
-    const commands = [_][]const u8{ "/new", "/model", "/exit" };
-    const count = commands.len;
+    const count = matchingCommandCount(self);
 
     if (ch == 27) {
         var seq: [1]u8 = undefined;
@@ -272,56 +300,56 @@ pub fn handleCommandPaletteKey(self: *App, stdin: anytype, ch: u8) !bool {
             self.closeCommandPalette();
             try self.render();
             return true;
-         }
+        }
         if (seq[0] != '[') return true;
 
         var seq2: [1]u8 = undefined;
         const n2 = stdin.readSliceShort(&seq2) catch 0;
         if (n2 == 0) return true;
         switch (seq2[0]) {
-             'A' => {
+            'A' => {
                 if (self.command_selected > 0) self.command_selected -= 1;
-             },
-             'B' => {
+            },
+            'B' => {
                 if (self.command_selected + 1 < count) self.command_selected += 1;
-             },
+            },
             else => {},
-         }
+        }
         try self.render();
         return true;
-     }
+    }
 
     switch (ch) {
-         3, 'q', 27 => {
+        3, 27 => {
             self.closeCommandPalette();
             try self.render();
             return true;
-         },
-         '\r', '\n' => {
-            const idx = self.command_selected;
+        },
+        '\r', '\n' => {
+            const idx = nthMatchingCommandIndex(self, self.command_selected) orelse {
+                self.closeCommandPalette();
+                return false;
+            };
+            const command = app_mod.command_palette_commands[idx];
             self.closeCommandPalette();
-            if (idx == 0) { // /new
-                try self.resetConversation();
-            } else if (idx == 1) { // /model
-                try self.openModelModal();
-            } else if (idx == 2) { // /exit
+            self.input.clearRetainingCapacity();
+            self.cursor_pos = 0;
+            self.input_cleared = false;
+            if (std.mem.eql(u8, command, "/exit")) {
                 return error.Exit;
+            } else if (std.mem.eql(u8, command, "/model")) {
+                try self.openModelModal();
+            } else if (std.mem.eql(u8, command, "/new")) {
+                try self.resetConversation();
             }
             try self.render();
             return true;
-         },
-         'k' => {
-            if (self.command_selected > 0) self.command_selected -= 1;
-         },
-         'j' => {
-            if (self.command_selected + 1 < count) self.command_selected += 1;
-         },
+        },
         else => {
-            self.closeCommandPalette();
-            try self.render();
+            self.command_selected = 0;
             return false;
-         },
-     }
+        },
+    }
     try self.render();
     return true;
 }

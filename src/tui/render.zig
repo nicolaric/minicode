@@ -132,6 +132,12 @@ pub fn renderWelcome(self: *App) !void {
         return;
     }
 
+    if (self.show_command_palette) {
+        const command_palette_height: usize = 6;
+        const palette_top = top_margin + app_mod.welcome_title_lines.len + title_to_input_gap + 1 - command_palette_height + 1;
+        try components.printCommandPaletteAt(self, stdout, palette_top, input_left_margin + 1, input_width);
+    }
+
     const cursor_row = if (welcome_room_for_input == 0) 0 else self.cursor_pos / welcome_room_for_input;
     const first_visible_row = firstVisibleWelcomeInputRow(self, welcome_room_for_input);
     const cursor_row_in_box = cursor_row - first_visible_row;
@@ -236,6 +242,7 @@ pub fn renderWelcomeInput(self: *App) !void {
     defer stdout.flush() catch {};
 
     const size = terminal.size();
+    const rows = size.rows;
     const cols = size.cols;
 
     // Use cached top_margin from first render for consistent positioning
@@ -247,11 +254,11 @@ pub fn renderWelcomeInput(self: *App) !void {
     const welcome_input_prefix_cols = welcome_border_cols + welcome_input_left_padding;
     const welcome_room_for_input: usize = if (utils.welcome_input_width > welcome_input_prefix_cols + welcome_input_right_padding)
         utils.welcome_input_width - welcome_input_prefix_cols - welcome_input_right_padding
-    else 0;
+    else
+        0;
     const welcome_input_content_rows = welcomeInputRows(self, welcome_room_for_input);
     const input_box_height = 2 + welcome_input_content_rows; // content rows + spacer row + bottom model row
     const title_to_input_gap: usize = 3;
-    _ = size.rows; // unused but needed for size.cols
 
     const input_width: usize = utils.welcome_input_width;
     const input_left_margin = (cols - input_width) / 2;
@@ -259,18 +266,30 @@ pub fn renderWelcomeInput(self: *App) !void {
     // Calculate the row where the input box starts (1-indexed for ANSI cursor positioning)
     const input_box_start_row = top_margin + title_height + title_to_input_gap;
 
-    // Clear old input box area by overwriting with spaces
+    // Clear old input box and command palette area by overwriting with spaces
+    const command_palette_height: usize = 5; // title + 3 commands + help
     var clear_row: usize = 0;
-    while (clear_row < input_box_height) : (clear_row += 1) {
+    while (clear_row < input_box_height + command_palette_height) : (clear_row += 1) {
         const row = input_box_start_row + clear_row + 1; // +1 because ANSI is 1-indexed
         try stdout.print("\x1b[{d};1H{s}\x1b[K", .{ row, theme.mocha.mantle_bg });
     }
 
     // Move cursor to input box start and redraw
-    try stdout.print("\x1b[{d};1H", .{ input_box_start_row + 1 });
+    try stdout.print("\x1b[{d};1H", .{input_box_start_row + 1});
 
     // Redraw input box
     try printWelcomeInputArea(self, stdout, input_width, input_left_margin);
+
+    if (self.show_model_modal) {
+        try components.printModelModal(self, stdout, rows, cols);
+        try stdout.writeAll("\x1b[?25l");
+        return;
+    }
+
+    if (self.show_command_palette) {
+        const palette_top = input_box_start_row - command_palette_height + 1;
+        try components.printCommandPaletteAt(self, stdout, palette_top, input_left_margin + 1, input_width);
+    }
 
     // Reposition cursor
     const cursor_row = if (welcome_room_for_input == 0) 0 else self.cursor_pos / welcome_room_for_input;
@@ -343,7 +362,7 @@ pub fn renderPrompt(self: *App, prompt: []const u8) !void {
     // One row margin above input box
     try stdout.print("{s}", .{theme.mocha.mantle_bg});
     try stdout.splatByteAll(' ', cols);
-    try stdout.print("\x1b[K{s}\n", .{theme.reset });
+    try stdout.print("\x1b[K{s}\n", .{theme.reset});
 
     try printScrollbar(stdout, @as(usize, cols), content_rows_with_margin, wrapped_count, first_row_to_show, max_scroll, top_margin + 1);
     try stdout.print("\x1b[{d};1H", .{content_rows + 2});
@@ -360,6 +379,12 @@ pub fn renderPrompt(self: *App, prompt: []const u8) !void {
         try components.printModelModal(self, stdout, rows, cols);
         try stdout.writeAll("\x1b[?25l");
         return;
+    }
+
+    if (self.show_command_palette) {
+        const command_palette_height = app_mod.command_palette_commands.len + 1;
+        const palette_top = @max(@as(usize, 1), rows - command_palette_height - 2);
+        try components.printCommandPaletteAt(self, stdout, palette_top, left_margin + 1, input_inner_cols);
     }
 
     const cursor_row = if (prompt_room_for_input == 0) 0 else self.cursor_pos / prompt_room_for_input;

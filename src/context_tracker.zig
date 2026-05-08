@@ -1,23 +1,17 @@
 const std = @import("std");
-const ollama = @import("ollama.zig");
 
 /// Tracks conversation context and generates periodic summaries
 /// to help the agent maintain awareness during long sessions.
-/// 
-/// This captures intent and project understanding that would otherwise
-/// be lost when thinking content is pruned after 4 rounds.
 pub const ContextTracker = struct {
-    /// Number of rounds (thinking phases + tool executions) in current turn
     round_count: usize,
-    /// Current project type/language detected from file operations
     project_type: ?[]const u8,
-    /// Build system detected (e.g., "zig build", "cargo build", "npm run")
     build_system: ?[]const u8,
-    /// Key project structure discoveries
     discoveries: std.ArrayList([]const u8),
-    /// What the agent is currently looking for/working on
     current_intent: ?[]const u8,
     allocator: std.mem.Allocator,
+
+    /// Previous summary text for dedup
+    last_summary: ?[]u8,
 
     pub const max_rounds_before_summary = 4;
 
@@ -29,44 +23,27 @@ pub const ContextTracker = struct {
             .discoveries = .empty,
             .current_intent = null,
             .allocator = allocator,
+            .last_summary = null,
         };
     }
 
     pub fn deinit(self: *ContextTracker) void {
-        for (self.discoveries.items) |discovery| {
-            self.allocator.free(discovery);
-        }
+        for (self.discoveries.items) |d| self.allocator.free(d);
         self.discoveries.deinit(self.allocator);
-        if (self.project_type) |pt| {
-            self.allocator.free(pt);
-        }
-        if (self.build_system) |bs| {
-            self.allocator.free(bs);
-        }
-        if (self.current_intent) |intent| {
-            self.allocator.free(intent);
-        }
+        if (self.project_type) |v| self.allocator.free(v);
+        if (self.build_system) |v| self.allocator.free(v);
+        if (self.current_intent) |v| self.allocator.free(v);
+        if (self.last_summary) |v| self.allocator.free(v);
     }
 
-    /// Call this at the start of each new conversation turn
     pub fn reset(self: *ContextTracker) void {
         self.round_count = 0;
-        for (self.discoveries.items) |discovery| {
-            self.allocator.free(discovery);
-        }
+        for (self.discoveries.items) |d| self.allocator.free(d);
         self.discoveries.clearRetainingCapacity();
-        if (self.project_type) |pt| {
-            self.allocator.free(pt);
-            self.project_type = null;
-        }
-        if (self.build_system) |bs| {
-            self.allocator.free(bs);
-            self.build_system = null;
-        }
-        if (self.current_intent) |intent| {
-            self.allocator.free(intent);
-            self.current_intent = null;
-        }
+        if (self.project_type) |v| { self.allocator.free(v); self.project_type = null; }
+        if (self.build_system) |v| { self.allocator.free(v); self.build_system = null; }
+        if (self.current_intent) |v| { self.allocator.free(v); self.current_intent = null; }
+        if (self.last_summary) |v| { self.allocator.free(v); self.last_summary = null; }
     }
 
     /// Record a tool execution to extract project context (not tool results)
@@ -194,44 +171,54 @@ pub const ContextTracker = struct {
         return self.round_count > 0 and self.round_count % max_rounds_before_summary == 0;
     }
 
-    /// Generate a narrative context summary for the agent
-    /// This replaces lost thinking content, not tool outputs
-    pub fn generateSummary(self: *const ContextTracker) ![]u8 {
+    pub fn generateSummary(self: *ContextTracker) !?[]u8 {
         var lines: std.ArrayList(u8) = .empty;
         defer lines.deinit(self.allocator);
 
-        // Header
-        try lines.appendSlice(self.allocator, "📋 Context Summary:\n");
-
-        // Project type
+        // Project info
         if (self.project_type) |pt| {
-            try lines.appendSlice(self.allocator, "- ");
             try lines.appendSlice(self.allocator, pt);
-            try lines.appendSlice(self.allocator, " project\n");
-        }
-
-        // Build system
-        if (self.build_system) |bs| {
-            try lines.appendSlice(self.allocator, "- Can be built with: ");
-            try lines.appendSlice(self.allocator, bs);
+            try lines.appendSlice(self.allocator, " project");
+            if (self.build_system) |bs| {
+                try lines.appendSlice(self.allocator, " (");
+                try lines.appendSlice(self.allocator, bs);
+                try lines.appendSlice(self.allocator, ")");
+            }
             try lines.appendSlice(self.allocator, "\n");
         }
 
-        // Current discoveries/intents
-        if (self.discoveries.items.len > 0) {
-            for (self.discoveries.items) |discovery| {
-                try lines.appendSlice(self.allocator, "- ");
-                try lines.appendSlice(self.allocator, discovery);
+        // Current discoveries
+        for (self.discoveries.items) |d| {
+            try lines.appendSlice(self.allocator, d);
+            try lines.appendSlice(self.allocator, "\n");
+        }
+
+        // Current intent (if not already in discoveries)
+        if (self.current_intent) |intent| {
+            var already_reported = false;
+            for (self.discoveries.items) |d| {
+                if (std.mem.eql(u8, d, intent)) { already_reported = true; break; }
+            }
+            if (!already_reported) {
+                try lines.appendSlice(self.allocator, intent);
                 try lines.appendSlice(self.allocator, "\n");
             }
         }
 
-        // If nothing discovered yet
-        if (lines.items.len == "📋 Context Summary:\n".len) {
-            try lines.appendSlice(self.allocator, "- Working on task...\n");
+        const result = try lines.toOwnedSlice(self.allocator);
+
+        // Skip if unchanged from last time
+        if (self.last_summary) |prev| {
+            if (std.mem.eql(u8, prev, result)) {
+                self.allocator.free(result);
+                return null;
+            }
         }
 
-        return lines.toOwnedSlice(self.allocator);
+        // Replace stored summary
+        if (self.last_summary) |prev| self.allocator.free(prev);
+        self.last_summary = try self.allocator.dupe(u8, result);
+        return result;
     }
 
     /// Record thinking content to extract intent
