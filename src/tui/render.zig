@@ -53,7 +53,7 @@ pub fn renderWelcome(self: *App) !void {
     else
         0;
     const welcome_input_content_rows = welcomeInputRows(self, welcome_room_for_input);
-    const input_box_height = 1 + welcome_input_content_rows; // content rows + bottom border only (no top border)
+    const input_box_height = 2 + welcome_input_content_rows; // content rows + spacer row + bottom model row
     const title_to_input_gap: usize = 3;
     const input_section_height = title_height + title_to_input_gap + input_box_height; // title + gap + input box
     const cool_stuff_height = 0;
@@ -199,7 +199,7 @@ fn printWelcomeInputArea(self: *App, stdout: anytype, input_width: usize, left_m
         try stdout.print("{s}\x1b[K{s}\n", .{ theme.mocha.mantle_bg, theme.reset });
     }
 
-    // Bottom row of input box - lavender border left, dark background
+    // Extra empty row between input content and model row
     try stdout.print("{s}", .{theme.mocha.mantle_bg});
     try stdout.splatByteAll(' ', left_margin);
     try stdout.print("{s}▌{s}", .{
@@ -207,6 +207,24 @@ fn printWelcomeInputArea(self: *App, stdout: anytype, input_width: usize, left_m
         theme.mocha.surface0_bg,
     });
     if (border_cols < input_width) try stdout.splatByteAll(' ', input_width - border_cols);
+    try stdout.print("{s}\x1b[K{s}\n", .{ theme.mocha.mantle_bg, theme.reset });
+
+    // Bottom row of input box with build info
+    try stdout.print("{s}", .{theme.mocha.mantle_bg});
+    try stdout.splatByteAll(' ', left_margin);
+    try stdout.print("{s}▌{s} ", .{
+        theme.mocha.lavender,
+        theme.mocha.surface0_bg,
+    });
+    const model_text = self.cfg.model;
+    const max_model_len = if (input_width > border_cols + input_left_padding + 2) input_width - border_cols - input_left_padding - 2 else 0;
+    const prefix_len = 8; // "Build · " length
+    const available_for_model = if (max_model_len > prefix_len) max_model_len - prefix_len else 0;
+    const display_model = if (model_text.len > available_for_model) model_text[0..available_for_model] else model_text;
+    try stdout.print("{s}Build{s} · {s}{s}", .{ theme.mocha.lavender, theme.mocha.subtext0, display_model, theme.mocha.surface0_bg });
+    const total_content_len = prefix_len + display_model.len;
+    const model_padding = if (total_content_len < max_model_len) max_model_len - total_content_len else 0;
+    if (model_padding > 0) try stdout.splatByteAll(' ', model_padding);
     try stdout.print("{s}\x1b[K{s}\n", .{ theme.mocha.mantle_bg, theme.reset });
 }
 
@@ -231,7 +249,7 @@ pub fn renderWelcomeInput(self: *App) !void {
         utils.welcome_input_width - welcome_input_prefix_cols - welcome_input_right_padding
     else 0;
     const welcome_input_content_rows = welcomeInputRows(self, welcome_room_for_input);
-    const input_box_height = 1 + welcome_input_content_rows;
+    const input_box_height = 2 + welcome_input_content_rows; // content rows + spacer row + bottom model row
     const title_to_input_gap: usize = 3;
     _ = size.rows; // unused but needed for size.cols
 
@@ -292,7 +310,8 @@ pub fn renderPrompt(self: *App, prompt: []const u8) !void {
 
     // Calculate confirmation box height if active
     const confirm_box_height: usize = if (self.confirm_dialog != null) 4 else 0;
-    const input_rows: usize = 4 + input_content_rows + confirm_box_height;
+    // input_rows: margin + input box rows + extra box row + loader + confirm dialog
+    const input_rows: usize = 5 + input_content_rows + confirm_box_height;
     const content_rows: usize = rows - input_rows;
 
     try stdout.print("\x1b[?25l{s}\x1b[H", .{theme.mocha.mantle_bg});
@@ -324,7 +343,7 @@ pub fn renderPrompt(self: *App, prompt: []const u8) !void {
     // One row margin above input box
     try stdout.print("{s}", .{theme.mocha.mantle_bg});
     try stdout.splatByteAll(' ', cols);
-    try stdout.print("\x1b[K{s}\n", .{theme.reset});
+    try stdout.print("\x1b[K{s}\n", .{theme.reset });
 
     try printScrollbar(stdout, @as(usize, cols), content_rows_with_margin, wrapped_count, first_row_to_show, max_scroll, top_margin + 1);
     try stdout.print("\x1b[{d};1H", .{content_rows + 2});
@@ -346,7 +365,7 @@ pub fn renderPrompt(self: *App, prompt: []const u8) !void {
     const cursor_row = if (prompt_room_for_input == 0) 0 else self.cursor_pos / prompt_room_for_input;
     const first_visible_row = firstVisiblePromptInputRow(self, prompt_room_for_input, max_prompt_rows);
     const cursor_row_in_box = cursor_row - first_visible_row;
-    const input_row = content_rows + 1 + cursor_row_in_box + if (self.confirm_dialog != null) @as(usize, 4) else 0;
+    const input_row = content_rows + 2 + cursor_row_in_box + if (self.confirm_dialog != null) @as(usize, 4) else 0;
     try stdout.print("\x1b[{d};{d}H\x1b[?25h", .{ input_row, cursor_col });
 }
 
@@ -591,7 +610,7 @@ fn printInputArea(self: *App, stdout: anytype, prompt: []const u8, inner_cols: u
         try stdout.print("{s}\x1b[K{s}\n", .{ theme.mocha.mantle_bg, theme.reset });
     }
 
-    // Bottom border - lavender left border, dark background
+    // Extra empty row inside the input box
     try stdout.print("{s}", .{theme.mocha.mantle_bg});
     try writeMargin(stdout, left_margin);
     try stdout.print("{s}▌{s}", .{
@@ -601,13 +620,26 @@ fn printInputArea(self: *App, stdout: anytype, prompt: []const u8, inner_cols: u
     if (border_cols < inner_cols) try stdout.splatByteAll(' ', inner_cols - border_cols);
     try stdout.print("{s}\x1b[K{s}\n", .{ theme.mocha.mantle_bg, theme.reset });
 
-    try printPendingLoader(self, stdout, inner_cols, left_margin);
-
-    // Small space below input box
+    // Bottom row of input box with build info
     try stdout.print("{s}", .{theme.mocha.mantle_bg});
     try writeMargin(stdout, left_margin);
-    try stdout.splatByteAll(' ', inner_cols);
-    try stdout.print("\x1b[K{s}\n", .{theme.reset});
+    try stdout.print("{s}▌{s} ", .{
+        theme.mocha.lavender,
+        theme.mocha.surface0_bg,
+    });
+    const model_text = self.cfg.model;
+    const max_model_len = if (inner_cols > border_cols + input_left_padding + 2) inner_cols - border_cols - input_left_padding - 2 else 0;
+    const prefix_len = 8; // "Build · " length
+    const available_for_model = if (max_model_len > prefix_len) max_model_len - prefix_len else 0;
+    const display_model = if (model_text.len > available_for_model) model_text[0..available_for_model] else model_text;
+    try stdout.print("{s}Build{s} · {s}{s}", .{ theme.mocha.lavender, theme.mocha.subtext0, display_model, theme.mocha.surface0_bg });
+    const total_content_len = prefix_len + display_model.len;
+    const model_padding = if (total_content_len < max_model_len) max_model_len - total_content_len else 0;
+    if (model_padding > 0) try stdout.splatByteAll(' ', model_padding);
+    try stdout.print("{s}\x1b[K{s}\n", .{ theme.mocha.mantle_bg, theme.reset });
+
+    // Loader row (outside input box, below border)
+    try printPendingLoader(self, stdout, inner_cols, left_margin);
 
     const cursor_col_in_box = if (room_for_input == 0) 0 else self.cursor_pos % room_for_input;
     return left_margin + border_cols + input_left_padding + cursor_col_in_box + 1;

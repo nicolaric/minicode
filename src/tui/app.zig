@@ -11,6 +11,7 @@ const utils = @import("utils.zig");
 const input_mod = @import("input.zig");
 const render_mod = @import("render.zig");
 const components = @import("components.zig");
+const context_tracker = @import("../context_tracker.zig");
 
 const thinking_marker = utils.thinking_marker;
 const user_marker = utils.user_marker;
@@ -82,6 +83,11 @@ pub const App = struct {
     is_preloading: bool,
     // Welcome screen cached layout
     welcome_top_margin: ?usize,
+    // Context tracking for long conversations
+    tracker: context_tracker.ContextTracker,
+    // Request timing
+    request_start_time: ?i64,
+    last_request_duration: ?f64,
 
     pub fn init(allocator: std.mem.Allocator, cfg: config.Config) !App {
         const highlighter = try syntax_highlight.SyntaxHighlighter.create(allocator);
@@ -99,6 +105,9 @@ pub const App = struct {
             } else |_| {}
         }
         errdefer if (owned_model) |model| allocator.free(model);
+
+        var tracker = context_tracker.ContextTracker.init(allocator);
+        errdefer tracker.deinit();
 
         return .{
             .allocator = allocator,
@@ -142,6 +151,9 @@ pub const App = struct {
             .preload_complete = std.atomic.Value(bool).init(false),
             .is_preloading = false,
             .welcome_top_margin = null,
+            .tracker = tracker,
+            .request_start_time = null,
+            .last_request_duration = null,
         };
     }
 
@@ -174,6 +186,7 @@ pub const App = struct {
             thread.join();
             self.preload_thread = null;
         }
+        self.tracker.deinit();
     }
 
     const PreloadContext = struct {
@@ -323,6 +336,10 @@ pub const App = struct {
                     self.scroll_offset = 0;
                     self.input_cleared = false;
                     self.is_busy = true;
+                    var ts: std.c.timespec = undefined;
+                    if (std.c.clock_gettime(.REALTIME, &ts) == 0) {
+                        self.request_start_time = @as(i64, ts.sec) * 1000 + @divTrunc(@as(i64, ts.nsec), 1_000_000);
+                    }
 
                     // Only add spacing if not first message
                     if (!is_first_message and self.lines.items.len > 0) {
@@ -342,6 +359,13 @@ pub const App = struct {
                         try self.addLine("Error during turn: {s}", .{@errorName(err)});
                     };
                     self.is_busy = false;
+                    if (self.request_start_time) |start_time| {
+                        var end_ts: std.c.timespec = undefined;
+                        if (std.c.clock_gettime(.REALTIME, &end_ts) == 0) {
+                            const end_time = @as(i64, end_ts.sec) * 1000 + @divTrunc(@as(i64, end_ts.nsec), 1_000_000);
+                            self.last_request_duration = @as(f64, @floatFromInt(end_time - start_time)) / 1000.0;
+                        }
+                    }
                     try self.render();
                 },
                 127, 8 => {
@@ -625,6 +649,7 @@ pub const App = struct {
         self.clearReadContinuations();
         self.show_welcome = true;
         self.welcome_rendered = false;
+        self.tracker.reset();
     }
 
     pub fn clearReadRequests(self: *App) void {
@@ -837,17 +862,48 @@ pub const App = struct {
     }
 
     pub fn addToolResultDetails(self: *App, path: []const u8, result: []const u8) !void {
-        const safe_path = try utils.sanitizeAlloc(self.allocator, path);
-        defer self.allocator.free(safe_path);
+        _ = path;
 
         // Spacer before diff box
         try self.addLine("", .{});
         try self.addLine(diff_box_marker, .{});
-        try self.addLine(diff_box_marker ++ "{s}📄 {s}", .{ theme.mocha.blue, safe_path });
-        try self.addLine(diff_box_marker, .{});
 
         var it = std.mem.splitScalar(u8, result, '\n');
+        var first_line = true;
+        var status_shown = false;
         while (it.next()) |line| {
+            // Show the first status line with an arrow icon inside the diff box
+            if (first_line) {
+                first_line = false;
+                if (std.mem.startsWith(u8, line, "Edited ") or
+                    std.mem.startsWith(u8, line, "Updated ") or
+                    std.mem.startsWith(u8, line, "Created ")) {
+                    // Show status with left arrow icon, change "Edited" to "Edit"
+                    var action: []const u8 = "Create";
+                    var rest_start: usize = 8;
+                    if (std.mem.startsWith(u8, line, "Edited ")) {
+                        action = "Edit";
+                        rest_start = 6;
+                    } else if (std.mem.startsWith(u8, line, "Updated ")) {
+                        action = "Update";
+                        rest_start = 8;
+                    }
+                    const rest = if (line.len > rest_start) line[rest_start..] else "";
+                    try self.addLine(diff_box_marker ++ "{s}← {s}{s}{s}", .{ theme.mocha.subtext0, action, rest, theme.reset });
+                    status_shown = true;
+                    continue;
+                }
+            }
+            
+            // Skip empty lines
+            if (line.len == 0) continue;
+            
+            // Add separator line after status before first diff content
+            if (status_shown) {
+                try self.addLine(diff_box_marker, .{});
+                status_shown = false;
+            }
+            
             // Diff output already contains ANSI color codes - don't sanitize them
             // Just ensure no harmful control characters
             const safe_line = try utils.sanitizeAnsiAlloc(self.allocator, line);
@@ -1151,6 +1207,7 @@ pub const App = struct {
 
     pub fn shouldCancelCallback(self: *App) !bool {
         try self.processPendingInputWhileBusy();
+        if (self.is_busy) try self.render();
         return self.cancel_requested;
     }
 
@@ -1320,6 +1377,10 @@ pub const App = struct {
         if (chunk.thinking_delta) |td| {
             self.thinking_started = true;
             try self.stream_thinking.appendSlice(self.allocator, td);
+            // Track thinking as a round (only on first thinking chunk to avoid overcounting)
+            if (self.stream_thinking.items.len == td.len) {
+                self.tracker.recordThinking(td);
+            }
         }
 
         if (chunk.tool_calls) |calls| {
@@ -1542,6 +1603,8 @@ pub const App = struct {
                     const result = if (try self.repeatedReadError(request)) |read_error| blk: {
                         tool_failed = true;
                         break :blk read_error;
+                    } else if (try self.generateContextSummaryIfNeeded()) |summary| blk: {
+                        break :blk summary;
                     } else if (std.mem.eql(u8, safe_tool, "run_shell")) blk: {
                         // Set up shell streaming
                         self.is_shell_streaming = true;
@@ -1573,6 +1636,7 @@ pub const App = struct {
                     defer self.allocator.free(result);
                     tools.logToolCall(self.allocator, request, result);
                     try self.recordGrepResults(request, result);
+                    try self.tracker.recordToolExecution(safe_tool, request.args, result);
                     if (std.mem.startsWith(u8, result, "Error:") or std.mem.startsWith(u8, result, "Tool error:")) {
                         tool_failed = true;
                     }
@@ -1646,6 +1710,8 @@ pub const App = struct {
                 const result = if (try self.repeatedReadError(parsed.value)) |read_error| blk: {
                     tool_failed = true;
                     break :blk read_error;
+                } else if (try self.generateContextSummaryIfNeeded()) |summary| blk: {
+                    break :blk summary;
                 } else tools.executeWithConfirm(self.allocator, parsed.value, .{
                     .ctx = self,
                     .callback = confirmCallbackWrapper,
@@ -1656,6 +1722,7 @@ pub const App = struct {
                 defer self.allocator.free(result);
                 tools.logToolCall(self.allocator, parsed.value, result);
                 try self.recordGrepResults(parsed.value, result);
+                try self.tracker.recordToolExecution(safe_tool, parsed.value.args, result);
                 if (std.mem.startsWith(u8, result, "Error:") or std.mem.startsWith(u8, result, "Tool error:")) {
                     tool_failed = true;
                 }
@@ -1708,6 +1775,24 @@ pub const App = struct {
             return;
         }
     }
+
+    /// Generate context summary if enough rounds have passed.
+    /// Returns the summary message if generated, null otherwise.
+    fn generateContextSummaryIfNeeded(self: *App) !?[]u8 {
+        if (!self.tracker.shouldGenerateSummary()) {
+            return null;
+        }
+
+        const summary = try self.tracker.generateSummary();
+        errdefer self.allocator.free(summary);
+
+        // Add to UI
+        try self.addLine("", .{});
+        try self.addLine("{s}", .{summary});
+        try self.addLine("", .{});
+
+        return summary;
+    }
 };
 
 // Callback functions passed to ollama.chatStream - these need the correct type signature
@@ -1732,4 +1817,3 @@ pub fn shellStreamCallbackWrapper(ctx: *anyopaque, output: []const u8, is_stderr
     const self: *App = @ptrCast(@alignCast(ctx));
     self.handleShellStream(output, is_stderr);
 }
-

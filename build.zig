@@ -80,4 +80,21 @@ pub fn build(b: *std.Build) void {
     
     const shell_test_step = b.step("test-shell", "Run shell execution tests only");
     shell_test_step.dependOn(&run_shell_tests.step);
+    
+    // Context tracker tests
+    const context_tracker_tests = b.addTest(.{
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("tests/context_tracker_test.zig"),
+            .target = target,
+            .optimize = optimize,
+        }),
+    });
+    context_tracker_tests.root_module.addImport("context_tracker", b.createModule(.{
+        .root_source_file = b.path("src/context_tracker.zig"),
+        .target = target,
+        .optimize = optimize,
+    }));
+    
+    const run_context_tracker_tests = b.addRunArtifact(context_tracker_tests);
+    test_step.dependOn(&run_context_tracker_tests.step);
 }
