@@ -17,6 +17,8 @@ const thinking_marker = utils.thinking_marker;
 const user_marker = utils.user_marker;
 const diff_box_marker = utils.diff_box_marker;
 const shell_output_marker = utils.shell_output_marker;
+const hidden_marker = utils.hidden_marker;
+const toggle_marker = utils.toggle_marker;
 const GrepMatch = utils.GrepMatch;
 const ReadContinuation = utils.ReadContinuation;
 const ConfirmDialog = utils.ConfirmDialog;
@@ -33,11 +35,18 @@ pub const welcome_title_lines = [_][]const u8{
 pub const command_palette_commands = [_][]const u8{
     "/exit",
     "/model",
+    "/thinking",
     "/new",
 };
 
 // Empty banner (can be customized)
 const minicode_banner = "";
+
+pub const CollapsibleRegion = struct {
+    toggle_index: usize,
+    hidden_count: usize,
+    expanded: bool,
+};
 
 pub const App = struct {
     allocator: std.mem.Allocator,
@@ -74,6 +83,9 @@ pub const App = struct {
     model_names: ?[][]u8,
     model_error: ?[]u8,
     model_selected: usize,
+    // Thinking modal state
+    show_thinking_modal: bool,
+    thinking_selected: usize,
     // Command palette state
     show_command_palette: bool,
     command_selected: usize,
@@ -83,6 +95,8 @@ pub const App = struct {
     shell_stream_content: std.ArrayList(u8),
     shell_stream_lines_start: usize,
     is_shell_streaming: bool,
+    // Collapsible shell output regions
+    collapsible_regions: std.ArrayList(CollapsibleRegion),
     // Model preloading state
     preload_thread: ?std.Thread,
     preload_complete: std.atomic.Value(bool),
@@ -147,12 +161,15 @@ pub const App = struct {
             .model_names = null,
             .model_error = null,
             .model_selected = 0,
+            .show_thinking_modal = false,
+            .thinking_selected = 0,
             .show_command_palette = false,
             .command_selected = 0,
             .confirm_dialog = null,
             .shell_stream_content = .empty,
             .shell_stream_lines_start = 0,
             .is_shell_streaming = false,
+            .collapsible_regions = .empty,
             .preload_thread = null,
             .preload_complete = std.atomic.Value(bool).init(false),
             .is_preloading = false,
@@ -188,6 +205,7 @@ pub const App = struct {
             self.allocator.free(dialog.prompt);
         }
         self.shell_stream_content.deinit(self.allocator);
+        self.collapsible_regions.deinit(self.allocator);
         if (self.preload_thread) |thread| {
             thread.join();
             self.preload_thread = null;
@@ -209,7 +227,7 @@ pub const App = struct {
     pub fn start(self: *App) !void {
         try self.addSystemPrompt();
         self.is_preloading = true;
-        try self.render();
+        self.render();
         const ctx = PreloadContext{
             .allocator = self.allocator,
             .cfg = self.cfg,
@@ -235,28 +253,33 @@ pub const App = struct {
                     self.preload_thread.?.join();
                     self.preload_thread = null;
                     self.is_preloading = false;
-                    try self.render();
+                    self.render();
                 }
                 continue;
             }
             if (self.show_model_modal and try input_mod.handleModelModalKey(self, stdin, byte[0])) continue;
+            if (self.show_thinking_modal and try input_mod.handleThinkingModalKey(self, stdin, byte[0])) continue;
             if (self.show_command_palette and try input_mod.handleCommandPaletteKey(self, stdin, byte[0])) continue;
             switch (byte[0]) {
                 3 => { // Ctrl+C - exit the app (cancel streaming if active)
                     if (self.is_busy) {
                         self.cancel_requested = true;
-                        try self.render();
+                        self.render();
                         continue;
                     }
                     break;
                 },
                 21 => { // Ctrl+U - scroll up (half page)
                     self.scrollUp(self.getContentRows() / 2);
-                    try self.render();
+                    self.render();
                 },
                 4 => { // Ctrl+D - scroll down (half page)
                     self.scrollDown(self.getContentRows() / 2);
-                    try self.render();
+                    self.render();
+                },
+                5 => { // Ctrl+E - toggle collapsible shell output
+                    try self.toggleCollapsibleOutput();
+                    self.render();
                 },
                 '/' => {
                     if (self.is_busy) continue;
@@ -266,13 +289,13 @@ pub const App = struct {
                         self.cursor_pos += 1;
                         self.show_command_palette = true;
                         self.command_selected = 0;
-                        try self.render();
+                        self.render();
                         continue;
                     }
                     if (self.input.items.len < utils.max_input) {
                         try self.input.insert(self.allocator, self.cursor_pos, '/');
                         self.cursor_pos += 1;
-                        try self.render();
+                        self.render();
                     }
                 },
                 '\r', '\n' => {
@@ -290,7 +313,7 @@ pub const App = struct {
                         self.input.clearRetainingCapacity();
                         self.cursor_pos = 0;
                         self.input_cleared = false;
-                        try self.render();
+                        self.render();
                         continue;
                     }
                     if (std.mem.eql(u8, trimmed, "/exit") or std.mem.eql(u8, trimmed, "/quit")) {
@@ -299,7 +322,7 @@ pub const App = struct {
                     }
                     if (std.mem.eql(u8, trimmed, "/new")) {
                         try self.resetConversation();
-                        try self.render();
+                        self.render();
                         continue;
                     }
                     if (std.mem.eql(u8, trimmed, "/model")) {
@@ -307,7 +330,15 @@ pub const App = struct {
                         self.cursor_pos = 0;
                         self.input_cleared = false;
                         try self.openModelModal();
-                        try self.render();
+                        self.render();
+                        continue;
+                    }
+                    if (std.mem.eql(u8, trimmed, "/thinking")) {
+                        self.input.clearRetainingCapacity();
+                        self.cursor_pos = 0;
+                        self.input_cleared = false;
+                        self.openThinkingModal();
+                        self.render();
                         continue;
                     }
 
@@ -370,7 +401,7 @@ pub const App = struct {
                         self.last_paste_content = null;
                     }
                     const stream_start = self.lines.items.len;
-                    try self.render();
+                    self.render();
                     completeTurn(self, stream_start) catch |err| {
                         try self.addLine("Error during turn: {s}", .{@errorName(err)});
                     };
@@ -382,7 +413,7 @@ pub const App = struct {
                             self.last_request_duration = @as(f64, @floatFromInt(end_time - start_time)) / 1000.0;
                         }
                     }
-                    try self.render();
+                    self.render();
                 },
                 127, 8 => {
                     if (self.cursor_pos > 0 and self.input.items.len > 0) {
@@ -395,13 +426,13 @@ pub const App = struct {
                             self.closeCommandPalette();
                         }
                     }
-                    try self.render();
+                    self.render();
                 },
                 27 => {
                     // Check if we're streaming - if so, request cancellation
                     if (self.is_busy) {
                         self.cancel_requested = true;
-                        try self.render();
+                        self.render();
                         continue;
                     }
                     // Escape sequence - read next byte with short timeout
@@ -418,25 +449,25 @@ pub const App = struct {
                         switch (seq2[0]) {
                             'A' => { // Up arrow / alternate-scroll wheel up
                                 self.scrollUp(3);
-                                try self.render();
+                                self.render();
                             },
                             'B' => { // Down arrow / alternate-scroll wheel down
                                 self.scrollDown(3);
-                                try self.render();
+                                self.render();
                             },
                             'D' => { // Left arrow
                                 if (self.cursor_pos > 0) self.cursor_pos -= 1;
-                                try self.render();
+                                self.render();
                             },
                             'C' => { // Right arrow
                                 if (self.cursor_pos < self.input.items.len) self.cursor_pos += 1;
-                                try self.render();
+                                self.render();
                             },
                             '<' => {
-                                if (try input_mod.handleSgrMouse(self, stdin)) try self.render();
+                                if (try input_mod.handleSgrMouse(self, stdin)) self.render();
                             },
                             '1' => {
-                                if (try input_mod.handleModifiedArrow(self, stdin)) try self.render();
+                                if (try input_mod.handleModifiedArrow(self, stdin)) self.render();
                             },
                             '2' => {
                                 var seq3: [1]u8 = undefined;
@@ -468,7 +499,7 @@ pub const App = struct {
                                         _ = self.input.insertSlice(self.allocator, self.cursor_pos, replacement) catch continue;
                                         self.cursor_pos += replacement.len;
                                         self.paste_buffer.clearRetainingCapacity();
-                                        try self.render();
+                                        self.render();
                                         continue;
                                     }
                                 }
@@ -479,7 +510,7 @@ pub const App = struct {
                                 const nt = stdin.readSliceShort(&tilde) catch 0;
                                 if (nt > 0 and tilde[0] == '~') {
                                     self.scrollUp(self.getContentRows());
-                                    try self.render();
+                                    self.render();
                                 }
                             },
                             '6' => {
@@ -488,7 +519,7 @@ pub const App = struct {
                                 const nt = stdin.readSliceShort(&tilde) catch 0;
                                 if (nt > 0 and tilde[0] == '~') {
                                     self.scrollDown(self.getContentRows());
-                                    try self.render();
+                                    self.render();
                                 }
                             },
                             '3' => {
@@ -499,7 +530,7 @@ pub const App = struct {
                                     if (self.cursor_pos < self.input.items.len) {
                                         _ = self.input.orderedRemove(self.cursor_pos);
                                     }
-                                    try self.render();
+                                    self.render();
                                 }
                             },
                             else => {},
@@ -507,15 +538,15 @@ pub const App = struct {
                     } else switch (seq[0]) {
                         'b' => { // Option+Left in many terminals
                             self.moveCursorWordLeft();
-                            try self.render();
+                            self.render();
                         },
                         'f' => { // Option+Right in many terminals
                             self.moveCursorWordRight();
-                            try self.render();
+                            self.render();
                         },
                         127, 8 => { // Option+Delete / Option+Backspace
                             self.deleteWordLeft();
-                            try self.render();
+                            self.render();
                         },
                         else => {},
                     }
@@ -535,7 +566,7 @@ pub const App = struct {
                                     self.closeCommandPalette();
                                 }
                             }
-                            try self.render();
+                            self.render();
                         }
                     }
                 },
@@ -543,16 +574,22 @@ pub const App = struct {
         }
     }
 
-    pub fn render(self: *App) !void {
+    pub fn render(self: *App) void {
         if (self.show_welcome) {
             if (self.welcome_rendered) {
-                try render_mod.renderWelcomeInput(self);
+                render_mod.renderWelcomeInput(self) catch {
+                    terminal.ensureForeground(std.posix.STDIN_FILENO);
+                };
             } else {
-                try render_mod.renderWelcome(self);
+                render_mod.renderWelcome(self) catch {
+                    terminal.ensureForeground(std.posix.STDIN_FILENO);
+                };
                 self.welcome_rendered = true;
             }
         } else {
-            try render_mod.renderPrompt(self, "");
+            render_mod.renderPrompt(self, "") catch {
+                terminal.ensureForeground(std.posix.STDIN_FILENO);
+            };
         }
     }
 
@@ -641,6 +678,24 @@ pub const App = struct {
         }
     }
 
+    pub fn openThinkingModal(self: *App) void {
+        self.show_command_palette = false;
+        self.command_selected = 0;
+        self.input.clearRetainingCapacity();
+        self.cursor_pos = 0;
+        self.input_cleared = false;
+        self.show_thinking_modal = true;
+        // Set selected to current thinking level
+        self.thinking_selected = @intFromEnum(self.cfg.thinking_level);
+    }
+
+    pub fn closeThinkingModal(self: *App) void {
+        self.show_thinking_modal = false;
+        if (self.show_welcome) {
+            self.welcome_rendered = false;
+        }
+    }
+
     pub fn closeCommandPalette(self: *App) void {
         self.show_command_palette = false;
         // Force full redraw on welcome screen since palette overlaps with title/gap area
@@ -651,7 +706,7 @@ pub const App = struct {
     }
 
     fn addSystemPrompt(self: *App) !void {
-        try self.messages.append(self.allocator, .{ .role = .system, .content = try self.allocator.dupe(u8, agent.system_prompt) });
+        try self.messages.append(self.allocator, .{ .role = .system, .content = try agent.systemPromptAlloc(self.allocator) });
     }
 
     pub fn clearMessages(self: *App) void {
@@ -688,6 +743,12 @@ pub const App = struct {
         self.clearReadRequests();
         self.clearGrepMatches();
         self.clearReadContinuations();
+        self.collapsible_regions.clearRetainingCapacity();
+        // Free confirm dialog if active
+        if (self.confirm_dialog) |*dialog| {
+            self.allocator.free(dialog.prompt);
+            self.confirm_dialog = null;
+        }
         self.show_welcome = true;
         self.welcome_rendered = false;
         self.tracker.reset();
@@ -972,18 +1033,65 @@ pub const App = struct {
         if (result.len == 0) {
             try self.addLine(diff_box_marker ++ "{s}(no output)", .{theme.mocha.subtext0});
         } else {
+            const max_visible: usize = 20;
+            var hidden_count: usize = 0;
+            var line_idx: usize = 0;
             var it = std.mem.splitScalar(u8, result, '\n');
             while (it.next()) |line| {
+                line_idx += 1;
                 const safe_line = try utils.sanitizeAnsiAlloc(self.allocator, line);
                 defer self.allocator.free(safe_line);
-                if (failed) {
-                    try self.addLine(diff_box_marker ++ "{s}{s}", .{ theme.mocha.red, safe_line });
+                if (line_idx > max_visible) {
+                    if (failed) {
+                        try self.addLine(hidden_marker ++ "{s}{s}", .{ theme.mocha.red, safe_line });
+                    } else {
+                        try self.addLine(hidden_marker ++ "{s}", .{safe_line});
+                    }
+                    hidden_count += 1;
                 } else {
-                    try self.addLine(diff_box_marker ++ "{s}", .{safe_line});
+                    if (failed) {
+                        try self.addLine(diff_box_marker ++ "{s}{s}", .{ theme.mocha.red, safe_line });
+                    } else {
+                        try self.addLine(diff_box_marker ++ "{s}", .{safe_line});
+                    }
                 }
+            }
+            if (hidden_count > 0) {
+                const text = try std.fmt.allocPrint(self.allocator, toggle_marker ++ "\x1b[2m▸ {d} more lines (Ctrl+E)\x1b[22m", .{hidden_count});
+                try self.lines.append(self.allocator, text);
+                try self.collapsible_regions.append(self.allocator, .{
+                    .toggle_index = self.lines.items.len - 1,
+                    .hidden_count = hidden_count,
+                    .expanded = false,
+                });
             }
         }
         try self.addLine(diff_box_marker, .{});
+    }
+
+    pub fn toggleCollapsibleOutput(self: *App) !void {
+        const count = self.collapsible_regions.items.len;
+        if (count == 0) return;
+        const region = &self.collapsible_regions.items[count - 1];
+
+        // Swap hidden_marker (\x1fH) <-> diff_box_marker (\x1fD) on hidden lines
+        const new_byte: u8 = if (region.expanded) 'H' else 'D';
+        const hidden_start = region.toggle_index -| region.hidden_count;
+        const hidden_end = region.toggle_index;
+        for (hidden_start..hidden_end) |idx| {
+            const line = self.lines.items[idx];
+            if (line.len >= 2) line[1] = new_byte;
+        }
+
+        // Update toggle line text
+        const old_toggle = self.lines.items[region.toggle_index];
+        self.allocator.free(old_toggle);
+        if (region.expanded) {
+            self.lines.items[region.toggle_index] = try std.fmt.allocPrint(self.allocator, toggle_marker ++ "\x1b[2m▸ {d} more lines (Ctrl+E)\x1b[22m", .{region.hidden_count});
+        } else {
+            self.lines.items[region.toggle_index] = try self.allocator.dupe(u8, toggle_marker ++ "\x1b[2m▾ show less (Ctrl+E)\x1b[22m");
+        }
+        region.expanded = !region.expanded;
     }
 
     pub fn addToolError(self: *App, result: []const u8) !void {
@@ -1074,10 +1182,10 @@ pub const App = struct {
                 if (c == .string) main_arg = c.string;
             }
             if (args.object.get("offset")) |o| {
-                if (o == .integer) offset_arg = @intCast(o.integer);
+                if (o == .integer and o.integer >= 0) offset_arg = @intCast(o.integer);
             }
             if (args.object.get("limit")) |l| {
-                if (l == .integer) limit_arg = @intCast(l.integer);
+                if (l == .integer and l.integer >= 0) limit_arg = @intCast(l.integer);
             }
         }
 
@@ -1249,7 +1357,7 @@ pub const App = struct {
 
     pub fn shouldCancelCallback(self: *App) !bool {
         try self.processPendingInputWhileBusy();
-        if (self.is_busy) try self.render();
+        if (self.is_busy) self.render();
         return self.cancel_requested;
     }
 
@@ -1317,7 +1425,7 @@ pub const App = struct {
             }
         }
 
-        if (needs_render) try self.render();
+        if (needs_render) self.render();
     }
 
     fn followStreamingIfAtBottom(self: *App, previous_max_scroll: usize) void {
@@ -1373,8 +1481,10 @@ pub const App = struct {
                     // Truncate content if no tool calls
                     if (msg.tool_calls == null or msg.tool_calls.?.len == 0) {
                         if (msg.content.len > 0) {
-                            self.allocator.free(msg.content);
-                            msg.content = self.allocator.dupe(u8, "[Earlier response]") catch msg.content;
+                            if (self.allocator.dupe(u8, "[Earlier response]")) |d| {
+                                self.allocator.free(msg.content);
+                                msg.content = d;
+                            } else |_| {}
                         }
                     }
                 },
@@ -1387,11 +1497,22 @@ pub const App = struct {
                     }
                 },
                 .tool => {
-                    // KEEP tool results intact - contain file contents
-                    // But free tool_call_id to save memory
                     if (msg.tool_call_id) |id| {
                         self.allocator.free(id);
                         msg.tool_call_id = null;
+                    }
+                    if (msg.content.len > 300) {
+                        const first_nl = std.mem.indexOfScalar(u8, msg.content, '\n');
+                        const header = if (first_nl) |nl| msg.content[0..nl] else msg.content;
+                        var line_count: usize = 0;
+                        if (first_nl) |nl| {
+                            for (msg.content[nl + 1 ..]) |c| {
+                                if (c == '\n') line_count += 1;
+                            }
+                        }
+                        const truncated = std.fmt.allocPrint(self.allocator, "{s} [{d} lines]", .{ header, line_count }) catch continue;
+                        self.allocator.free(msg.content);
+                        msg.content = truncated;
                     }
                 },
                 .system => {},
@@ -1449,15 +1570,14 @@ pub const App = struct {
             const previous_max_scroll = self.getMaxScroll();
             try self.refreshStreamingLines();
             self.followStreamingIfAtBottom(previous_max_scroll);
-            try self.render();
+            self.render();
         }
     }
 
     pub fn refreshStreamingLines(self: *App) !void {
         // Clear previous streaming lines
         while (self.lines.items.len > self.stream_lines_start) {
-            const removed = self.lines.pop().?;
-            self.allocator.free(removed);
+            if (self.lines.pop()) |removed| self.allocator.free(removed);
         }
 
         if (self.stream_thinking.items.len > 0) {
@@ -1510,14 +1630,13 @@ pub const App = struct {
         const previous_max_scroll = self.getMaxScroll();
         self.refreshShellStreamingLines() catch return;
         self.followStreamingIfAtBottom(previous_max_scroll);
-        self.render() catch return;
+        self.render();
     }
 
     pub fn refreshShellStreamingLines(self: *App) !void {
         // Clear previous streaming lines
         while (self.lines.items.len > self.shell_stream_lines_start) {
-            const removed = self.lines.pop().?;
-            self.allocator.free(removed);
+            if (self.lines.pop()) |removed| self.allocator.free(removed);
         }
 
         // Display shell output
@@ -1549,7 +1668,7 @@ pub const App = struct {
             self.cancel_requested = false;
             self.stream_lines_start = stream_start;
 
-            ollama.chatStream(self.allocator, self.cfg, self.messages.items, self, streamingCallbackWrapper, shouldCancelCallbackWrapper) catch |err| {
+            ollama.chatStream(self.allocator, self.cfg, self.messages.items, self, streamingCallbackWrapper, shouldCancelCallbackWrapper, self.cfg.thinking_level) catch |err| {
                 if (err == error.Cancelled) {
                     // Add partial response if any content was received
                     if (self.stream_content.items.len > 0 or self.stream_thinking.items.len > 0 or self.stream_tool_calls.items.len > 0) {
@@ -1649,7 +1768,7 @@ pub const App = struct {
                     defer self.allocator.free(pending_summary);
                     try self.addLine("", .{});
                     try self.addLine("{s}", .{pending_summary});
-                    try self.render();
+                    self.render();
 
                     var tool_failed = false;
 
@@ -1697,7 +1816,12 @@ pub const App = struct {
 
                     const summary = try self.formatToolResultSummary(safe_tool, request.args, result);
                     defer self.allocator.free(summary);
-                    self.removeLineAt(self.lines.items.len - 1);
+                    if (std.mem.eql(u8, safe_tool, "run_shell")) {
+                        while (self.lines.items.len > self.shell_stream_lines_start) {
+                            if (self.lines.pop()) |removed| self.allocator.free(removed);
+                        }
+                    }
+                    if (self.lines.items.len > 0) self.removeLineAt(self.lines.items.len - 1);
                     try self.addLine("{s}", .{summary});
                     if (std.mem.eql(u8, safe_tool, "run_shell")) {
                         try self.addShellResultDetails(request.args, result, tool_failed);
@@ -1712,15 +1836,16 @@ pub const App = struct {
                     try self.addLine("", .{});
 
                     const tool_message = try std.fmt.allocPrint(self.allocator, "Result from tool `{s}`. Use this result to continue; do not repeat the same tool call unless you need a different offset, limit, path, or pattern.\n{s}", .{ request.tool, result });
-                    errdefer self.allocator.free(tool_message);
+                    const tool_name = try self.allocator.dupe(u8, request.tool);
+                    const tool_call_id = if (call.id) |id| try self.allocator.dupe(u8, id) else null;
                     try self.messages.append(self.allocator, .{
                         .role = .tool,
                         .content = tool_message,
-                        .tool_name = try self.allocator.dupe(u8, request.tool),
-                        .tool_call_id = if (call.id) |id| try self.allocator.dupe(u8, id) else null,
+                        .tool_name = tool_name,
+                        .tool_call_id = tool_call_id,
                     });
                     had_tool_result = true;
-                    try self.render();
+                    self.render();
                 }
                 stream_start = self.lines.items.len;
                 continue;
@@ -1758,7 +1883,7 @@ pub const App = struct {
                 defer self.allocator.free(pending_summary);
                 try self.addLine("", .{});
                 try self.addLine("{s}", .{pending_summary});
-                try self.render();
+                self.render();
 
                 var tool_failed = false;
                 const result = if (try self.repeatedReadError(parsed.value)) |read_error| blk: {
@@ -1804,7 +1929,7 @@ pub const App = struct {
                 const tool_message = try std.fmt.allocPrint(self.allocator, "Result from tool `{s}`. Use this result to continue; do not repeat the same tool call unless you need a different offset, limit, path, or pattern.\n{s}", .{ parsed.value.tool, result });
                 try self.messages.append(self.allocator, .{ .role = .user, .content = tool_message });
                 had_tool_result = true;
-                try self.render();
+                self.render();
                 // Update stream_start so next iteration doesn't clear previous content
                 stream_start = self.lines.items.len;
                 continue;
@@ -1818,7 +1943,7 @@ pub const App = struct {
                 try self.addLine("", .{});
                 const retry_message = try self.allocator.dupe(u8, error_message);
                 try self.messages.append(self.allocator, .{ .role = .user, .content = retry_message });
-                try self.render();
+                self.render();
                 stream_start = self.lines.items.len;
                 continue;
             }

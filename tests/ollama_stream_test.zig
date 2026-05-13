@@ -54,6 +54,7 @@ fn runChatStream(fake_curl_path: []const u8, state: *TestState) !void {
         streamCallback,
         neverCancel,
         fake_curl_path,
+        .off,
     );
 }
 

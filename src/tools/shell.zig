@@ -47,12 +47,16 @@ pub fn runShellStreaming(allocator: std.mem.Allocator, command: []const u8, conf
         try core.ensurePathHas(&env_map, allocator, local_bin);
     }
 
-    var child = std.process.spawn(std.Options.debug_io, .{
+    var threaded_io = std.Io.Threaded.init(allocator, .{});
+    defer threaded_io.deinit();
+    const io = threaded_io.io();
+
+    var child = std.process.spawn(io, .{
         .argv = &argv,
         .environ_map = &env_map,
         .stdin = .ignore,
         .stdout = .pipe,
-        .stderr = .pipe,
+        .stderr = .ignore,
     }) catch |err| {
         return std.fmt.allocPrint(allocator, "Error running command: {s}", .{@errorName(err)});
     };
@@ -62,78 +66,30 @@ pub fn runShellStreaming(allocator: std.mem.Allocator, command: []const u8, conf
         _ = core.setpgid(pid, pid);
     }
     
-    defer _ = child.wait(std.Options.debug_io) catch {};
+    defer _ = child.wait(io) catch {};
 
     var output = std.ArrayList(u8).empty;
     errdefer output.deinit(allocator);
 
-    // Use poll to read from both stdout and stderr with timeout for streaming
-    const stdout_fd = if (child.stdout) |f| f.handle else -1;
-    const stderr_fd = if (child.stderr) |f| f.handle else -1;
-
-    var stdout_done = stdout_fd < 0;
-    var stderr_done = stderr_fd < 0;
-
-    while (!stdout_done or !stderr_done) {
-        var poll_fds: [2]std.posix.pollfd = undefined;
-        var poll_count: usize = 0;
-
-        if (!stdout_done) {
-            poll_fds[poll_count] = .{ .fd = stdout_fd, .events = std.posix.POLL.IN, .revents = 0 };
-            poll_count += 1;
-        }
-        if (!stderr_done) {
-            poll_fds[poll_count] = .{ .fd = stderr_fd, .events = std.posix.POLL.IN, .revents = 0 };
-            poll_count += 1;
-        }
-
-        if (poll_count == 0) break;
-
-        // Poll with 50ms timeout to allow streaming
-        const ready = std.posix.poll(poll_fds[0..poll_count], 50) catch 0;
-
-        if (ready > 0) {
-            var idx: usize = 0;
-            if (!stdout_done) {
-                if (poll_fds[idx].revents & std.posix.POLL.IN != 0) {
-                    var buf: [4096]u8 = undefined;
-                    const n = std.posix.read(stdout_fd, &buf) catch 0;
-                    if (n == 0) {
-                        stdout_done = true;
-                    } else {
-                        try output.appendSlice(allocator, buf[0..n]);
-                        // Stream output if callback provided
-                        if (streamer) |s| {
-                            s.callback(s.ctx, buf[0..n], false);
-                        }
-                    }
-                } else if (poll_fds[idx].revents & (std.posix.POLL.HUP | std.posix.POLL.ERR) != 0) {
-                    stdout_done = true;
-                }
-                idx += 1;
-            }
-            if (!stderr_done) {
-                if (poll_fds[idx].revents & std.posix.POLL.IN != 0) {
-                    var buf: [4096]u8 = undefined;
-                    const n = std.posix.read(stderr_fd, &buf) catch 0;
-                    if (n == 0) {
-                        stderr_done = true;
-                    } else {
-                        if (output.items.len > 0) try output.append(allocator, '\n');
-                        try output.appendSlice(allocator, buf[0..n]);
-                        // Stream output if callback provided
-                        if (streamer) |s| {
-                            s.callback(s.ctx, buf[0..n], true);
-                        }
-                    }
-                } else if (poll_fds[idx].revents & (std.posix.POLL.HUP | std.posix.POLL.ERR) != 0) {
-                    stderr_done = true;
-                }
-            }
-        }
+    // Stderr is redirected into stdout in modified_command, so one pipe is enough.
+    if (child.stdout) |stdout_file| {
+        while (!(try readPipeChunk(allocator, io, stdout_file, &output, streamer))) {}
     }
 
     return output.toOwnedSlice(allocator);
+}
+
+fn readPipeChunk(allocator: std.mem.Allocator, io: std.Io, file: std.Io.File, output: *std.ArrayList(u8), streamer: ?ShellStream) !bool {
+    var buf: [4096]u8 = undefined;
+    var vecs = [_][]u8{buf[0..]};
+    const n = file.readStreaming(io, &vecs) catch |err| switch (err) {
+        error.EndOfStream => return true,
+        else => return true,
+    };
+    if (n == 0) return true;
+    try output.appendSlice(allocator, buf[0..n]);
+    if (streamer) |s| s.callback(s.ctx, buf[0..n], false);
+    return false;
 }
 
 fn isInteractiveOrNestedMinicodeCommand(command: []const u8) bool {

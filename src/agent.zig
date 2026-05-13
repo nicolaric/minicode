@@ -4,37 +4,45 @@ const ollama = @import("ollama.zig");
 const tools = @import("tools.zig");
 
 pub const system_prompt =
-    \\You are a coding assistant with LIMITED TOKENS. Be EXTREMELY concise.
-    \\RULE 1: If you can answer or act immediately, DO IT NOW. No preamble, no plan.
-    \\RULE 2: Use MAXIMUM 2 read_file calls, then YOU MUST EDIT. No exceptions.
-    \\RULE 3: DO NOT explain your plan. DO NOT "understand" the code. Just edit.
-    \\RULE 4: NO thinking tags. NO explanations. ONLY tool calls or code.
-    \\RULE 5: When using tools, output ONLY the JSON. No text before or after.
-    \\RULE 6: DO NOT verify your edit by reading the file again. Just continue.
-    \\RULE 7: If the user asks a simple question, answer in 1 sentence max.
-    \\RULE 8: Token budget: 500 for thinking, then you MUST act.
+    \\You are an expert coding assistant. You help users by reading files, executing
+    \\commands, editing code, and writing new files.
     \\
-    \\JSON FORMAT: {"tool":"TOOL_NAME","args":{"param1":"value1"}}
-    \\CORRECT: {"tool":"read_file","args":{"path":"src/main.zig"}}
-    \\WRONG: Let me check the file... {"tool":"read_file"...}
-    \\WRONG: {"tool":"grep","pattern":"foo","path":"src"}
+    \\Be concise in your responses.
+    \\Show file paths clearly when working with files.
     \\
-    \\NAVIGATION: 1) grep to find line. 2) read ONCE at that offset (limit 60). 3) edit IMMEDIATELY.
-    \\NEVER read "just a bit more." NEVER verify by reading again. Just edit.
-    \\
-    \\CONTEXT: Only last 4 conversation turns are kept in full. If you need to reference earlier file contents, use read_file again.
-    \\
-    \\Tools:
-    \\  read_file(path, offset?, limit?) - read file lines
-    \\  write_file(path, content) - write file
-    \\  list_files(path) - list directory
-    \\  run_shell(command) - run shell command (requires confirmation)
-    \\  glob(pattern, path?) - find files
-    \\  grep(pattern, path?, include?) - search files
-    \\  edit(path, oldString, newString) - replace text
-    \\
-    \\All paths relative to working directory. When grep shows line N, use offset=N exactly.
+    \\All paths must be relative to the working directory.
     ;
+
+/// Tool descriptions for the model - passed via tool result messages when needed
+pub const tool_descriptions =
+    \\Tools you can use:
+    \\- read_file(path, offset?, limit?): Read file lines. offset starts at 1, limit defaults to 300.
+    \\- write_file(path, content): Write or create a file.
+    \\- edit(path, oldString, newString): Replace unique text in a file.
+    \\- run_shell(command): Execute a shell command (requires confirmation).
+    \\- glob(pattern, path?): Find files matching a glob pattern.
+    \\- grep(pattern, path?, include?): Search file contents with regex.
+    \\- list_files(path?): List directory contents.
+    \\
+    \\Output tool calls as JSON: {"tool":"TOOL_NAME","args":{"param":"value"}}
+    ;
+
+pub fn systemPromptAlloc(allocator: std.mem.Allocator) ![]u8 {
+    const agents = std.Io.Dir.cwd().readFileAlloc(std.Options.debug_io, "AGENTS.md", allocator, .limited(128 * 1024)) catch |err| switch (err) {
+        error.FileNotFound, error.NotDir => return std.fmt.allocPrint(allocator, "{s}\n\n{s}", .{ system_prompt, tool_descriptions }),
+        else => return err,
+    };
+    defer allocator.free(agents);
+
+    return std.fmt.allocPrint(allocator,
+        \\{s}
+        \\
+        \\{s}
+        \\
+        \\WORKSPACE INSTRUCTIONS FROM AGENTS.md:
+        \\{s}
+    , .{ system_prompt, tool_descriptions, agents });
+}
 
 pub fn run(allocator: std.mem.Allocator, cfg: config.Config) !void {
     var stdout_buf: [8192]u8 = undefined;
@@ -55,7 +63,7 @@ pub fn run(allocator: std.mem.Allocator, cfg: config.Config) !void {
         messages.deinit(allocator);
     }
 
-    try messages.append(allocator, .{ .role = .system, .content = try allocator.dupe(u8, system_prompt) });
+    try messages.append(allocator, .{ .role = .system, .content = try systemPromptAlloc(allocator) });
 
     try stdout.print("zig-agent using {s} at {s}\nType /exit to quit.\n\n", .{ cfg.model, cfg.base_url });
 
@@ -73,13 +81,14 @@ pub fn run(allocator: std.mem.Allocator, cfg: config.Config) !void {
 }
 
 fn completeTurn(allocator: std.mem.Allocator, cfg: config.Config, messages: *std.ArrayList(ollama.Message)) !void {
+    const thinking_level = cfg.thinking_level;
     var stdout_buf: [8192]u8 = undefined;
         var stdout_file = std.Io.File.stdout().writerStreaming(std.Options.debug_io, &stdout_buf);
         const stdout = &stdout_file.interface;
         defer stdout.flush() catch {};
 
     while (true) {
-        const response = try ollama.chat(allocator, cfg, messages.items);
+        const response = try ollama.chat(allocator, cfg, messages.items, thinking_level);
         try messages.append(allocator, .{ .role = .assistant, .content = response.content, .thinking = response.thinking, .tool_calls = response.tool_calls });
 
         if (response.tool_calls) |tool_calls| {
@@ -95,12 +104,13 @@ fn completeTurn(allocator: std.mem.Allocator, cfg: config.Config, messages: *std
 
                 try stdout.print("\n[tool:{s}]\n{s}\n\n", .{ request.tool, result });
                 const tool_message = try std.fmt.allocPrint(allocator, "Result from tool `{s}`. Use this result to continue; do not repeat the same tool call unless you need a different offset, limit, path, or pattern.\n{s}", .{ request.tool, result });
-                errdefer allocator.free(tool_message);
+                const tool_name = try allocator.dupe(u8, request.tool);
+                const tool_call_id = if (call.id) |id| try allocator.dupe(u8, id) else null;
                 try messages.append(allocator, .{
                     .role = .tool,
                     .content = tool_message,
-                    .tool_name = try allocator.dupe(u8, request.tool),
-                    .tool_call_id = if (call.id) |id| try allocator.dupe(u8, id) else null,
+                    .tool_name = tool_name,
+                    .tool_call_id = tool_call_id,
                 });
             }
             continue;

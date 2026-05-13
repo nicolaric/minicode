@@ -16,17 +16,17 @@ pub fn diffAlloc(allocator: std.mem.Allocator, old_content: []const u8, new_cont
 
     // Detect language and highlight if possible
     const lang = if (highlighter) |_| syntax_highlight.SyntaxHighlighter.detectLanguage(path, new_content) else null;
-    
+
     var highlighted_old: ?[]const []u8 = null;
     var highlighted_new: ?[]const []u8 = null;
-    
+
     if (highlighter) |h| {
         if (lang) |language| {
             highlighted_old = h.highlightLines(language, old_content) catch null;
             highlighted_new = h.highlightLines(language, new_content) catch null;
         }
     }
-    
+
     defer {
         if (highlighted_old) |lines| {
             for (lines) |line| allocator.free(line);
@@ -143,35 +143,92 @@ pub fn diffAlloc(allocator: std.mem.Allocator, old_content: []const u8, new_cont
         for (render_lines[start..end]) |*should_render| should_render.* = true;
     }
 
-    // ANSI color codes
-    const red_bg = "\x1b[48;2;69;40;48m"; // Dark red background (like in screenshot)
-    const green_bg = "\x1b[48;2;40;69;48m"; // Dark green background (like in screenshot)
-    const dim_text = "\x1b[38;5;245m"; // Dim gray for context lines
-    const normal_text = "\x1b[0m"; // Reset
+    const panel_bg = "\x1b[48;2;49;50;68m";
+    const panel_alt_bg = "\x1b[48;2;69;71;90m";
+    const line_number_bg = "\x1b[48;2;49;50;68m";
+    const added_bg = "\x1b[48;2;40;69;48m";
+    const removed_bg = "\x1b[48;2;69;40;48m";
+    const text = "\x1b[38;2;205;214;244m";
+    const muted = "\x1b[38;2;127;132;156m";
+    const line_number = "\x1b[38;2;166;173;200m";
+    const added = "\x1b[38;2;166;227;161m";
+    const removed = "\x1b[38;2;243;139;168m";
+    const badge = "\x1b[38;2;137;180;250m";
+    const normal_text = "\x1b[0m";
 
-    // Calculate column width based on terminal size for centered split
-    // Account for TUI margins: left_margin=2, right_margin=3, plus scrollbar=1
     const term_width: usize = blk: {
         var ws: std.posix.winsize = .{ .row = 0, .col = 0, .xpixel = 0, .ypixel = 0 };
         const err = std.posix.system.ioctl(std.Io.File.stdout().handle, std.posix.T.IOCGWINSZ, @intFromPtr(&ws));
         break :blk if (std.posix.errno(err) == .SUCCESS and ws.col > 20) ws.col else 80;
     };
-    // TUI uses: inner_cols = cols - left_margin - right_margin = cols - 5
-    // Plus we need to account for the box border (2 chars: "▌ ")
-    const available_width = term_width - 5 - 2; // TUI margins minus box prefix
-    // Total per side: line_num(4) + spaces(2) + content + gap(5)
-    // Each side content width = (available_width - gap - line_num - spaces) / 2
-    const left_content_width = (available_width - 11) / 2;
+    const available_width = if (term_width > 7) term_width - 7 else 40;
 
-    // Render side-by-side diff with compact context hunks.
+    var additions: usize = 0;
+    var deletions: usize = 0;
+    var max_old_line: usize = 0;
+    var max_new_line: usize = 0;
+    for (diff_lines.items) |dl| {
+        if (dl.old_line) |ln| max_old_line = @max(max_old_line, ln);
+        if (dl.new_line) |ln| max_new_line = @max(max_new_line, ln);
+        if (dl.old_line == null) additions += 1 else if (dl.new_line == null) deletions += 1 else if (dl.old_idx != null and dl.new_idx != null and !std.mem.eql(u8, old_lines.items[dl.old_idx.?], new_lines.items[dl.new_idx.?])) {
+            additions += 1;
+            deletions += 1;
+        }
+    }
+
+    const line_digits = @max(@as(usize, 2), @max(decimalDigits(max_old_line), decimalDigits(max_new_line)));
+    const gutter_width = line_digits * 2 + 4; // old, new, sign, and spacing.
+    const content_width = if (available_width > gutter_width + 2) available_width - gutter_width - 2 else 20;
+
+    try result.print(allocator, "{s} {s}{s}{s}", .{ panel_bg, text, path, normal_text });
+    const path_len = stripAnsiLen(path);
+    const stats = try std.fmt.allocPrint(allocator, "+{d} -{d}", .{ additions, deletions });
+    defer allocator.free(stats);
+    const stats_len = stats.len;
+    if (available_width > path_len + stats_len + 3) {
+        try result.appendSlice(allocator, panel_bg);
+        try result.appendNTimes(allocator, ' ', available_width - path_len - stats_len - 3);
+        try result.print(allocator, " {s}{s}{s}", .{ added, stats, normal_text });
+    }
+    try result.append(allocator, '\n');
+
+    // Render a compact Hunk-style stack: rail, two line-number columns, sign, content.
     var previous_rendered = false;
     for (diff_lines.items, 0..) |dl, index| {
         if (!render_lines[index]) {
             if (previous_rendered) {
-                try result.appendSlice(allocator, "      ...                                           ...\n");
+                try result.print(allocator, "{s}{s}▌{s}{s} ··· unchanged lines ···", .{ panel_alt_bg, muted, badge, panel_alt_bg });
+                const collapsed_len = 25;
+                if (available_width > collapsed_len) try result.appendNTimes(allocator, ' ', available_width - collapsed_len);
+                try result.appendSlice(allocator, normal_text);
+                try result.append(allocator, '\n');
                 previous_rendered = false;
             }
             continue;
+        }
+
+        if (!previous_rendered) {
+            var old_start: usize = 0;
+            var new_start: usize = 0;
+            var old_count: usize = 0;
+            var new_count: usize = 0;
+            var scan = index;
+            while (scan < diff_lines.items.len and render_lines[scan]) : (scan += 1) {
+                const scan_line = diff_lines.items[scan];
+                if (scan_line.old_line) |ln| {
+                    if (old_start == 0) old_start = ln;
+                    old_count += 1;
+                }
+                if (scan_line.new_line) |ln| {
+                    if (new_start == 0) new_start = ln;
+                    new_count += 1;
+                }
+            }
+            try result.print(allocator, "{s}{s}▌{s}{s} @@ -{d},{d} +{d},{d} @@", .{ panel_alt_bg, muted, badge, panel_alt_bg, old_start, old_count, new_start, new_count });
+            const header_len = 7 + decimalDigits(old_start) + decimalDigits(old_count) + decimalDigits(new_start) + decimalDigits(new_count) + 7;
+            if (available_width > header_len) try result.appendNTimes(allocator, ' ', available_width - header_len);
+            try result.appendSlice(allocator, normal_text);
+            try result.append(allocator, '\n');
         }
         previous_rendered = true;
 
@@ -179,56 +236,25 @@ pub fn diffAlloc(allocator: std.mem.Allocator, old_content: []const u8, new_cont
             (dl.old_idx != null and dl.new_idx != null and
                 !std.mem.eql(u8, old_lines.items[dl.old_idx.?], new_lines.items[dl.new_idx.?]));
 
-        // Old side (left) - line number (4) + 2 spaces = 6 chars, content truncated to left_content_width
-        if (dl.old_line) |ln| {
-            const color = if (is_change) red_bg else dim_text;
-            const idx = dl.old_idx.?;
-            
-            // Use highlighted text if available and index is valid, otherwise plain text
-            // Note: highlighted arrays may have different length due to trailing newline handling
-            const display_text = if (highlighted_old) |hl| (if (idx < hl.len) hl[idx] else old_lines.items[idx]) else old_lines.items[idx];
-            const text_len = stripAnsiLen(display_text);
-
-            if (text_len > left_content_width) {
-                const truncated = try truncateAnsiText(allocator, display_text, left_content_width);
-                defer allocator.free(truncated);
-                try result.print(allocator, "{s}{d: >4}  {s}…{s}{s}", .{ color, ln, truncated, color, normal_text });
-            } else {
-                try result.print(allocator, "{s}{d: >4}  {s}", .{ color, ln, display_text });
-                try result.appendSlice(allocator, color); // Re-apply background color after potential resets in display_text
-                const padding = left_content_width - text_len;
-                try result.appendNTimes(allocator, ' ', padding);
-                try result.appendSlice(allocator, normal_text);
-            }
-        } else {
-            // Empty on old side - fill with spaces to maintain alignment
-            try result.appendNTimes(allocator, ' ', 6 + left_content_width);
+        if (is_change and dl.old_line != null and dl.new_line != null) {
+            const old_idx_for_row = dl.old_idx.?;
+            const new_idx_for_row = dl.new_idx.?;
+            const old_text = old_lines.items[old_idx_for_row];
+            const new_text = new_lines.items[new_idx_for_row];
+            try appendStackDiffRow(allocator, &result, dl.old_line, null, '-', old_text, line_digits, content_width, removed_bg, removed, removed, removed, line_number_bg, text, normal_text);
+            try appendStackDiffRow(allocator, &result, null, dl.new_line, '+', new_text, line_digits, content_width, added_bg, added, added, added, line_number_bg, text, normal_text);
+            continue;
         }
 
-        // Gap between sides
-        try result.appendSlice(allocator, "    ");
-
-        // New side (right) - always starts at same column
-        if (dl.new_line) |ln| {
-            const color = if (is_change) green_bg else dim_text;
-            const idx = dl.new_idx.?;
-            
-            // Use highlighted text if available and index is valid, otherwise plain text
-            // Note: highlighted arrays may have different length due to trailing newline handling
-            const display_text = if (highlighted_new) |hl| (if (idx < hl.len) hl[idx] else new_lines.items[idx]) else new_lines.items[idx];
-            const text_len = stripAnsiLen(display_text);
-
-            if (text_len > left_content_width) {
-                const truncated = try truncateAnsiText(allocator, display_text, left_content_width);
-                defer allocator.free(truncated);
-                try result.print(allocator, "{s}{d: >4}  {s}…{s}\n", .{ color, ln, truncated, normal_text });
-            } else {
-                try result.print(allocator, "{s}{d: >4}  {s}{s}\n", .{ color, ln, display_text, normal_text });
-            }
-        } else {
-            // Empty on new side
-            try result.print(allocator, "{s: >4}  {s}\n", .{ " ", normal_text });
-        }
+        const kind_bg = if (!is_change) panel_bg else if (dl.old_line == null) added_bg else removed_bg;
+        const rail_color = if (!is_change) muted else if (dl.old_line == null) added else removed;
+        const number_color = if (!is_change) line_number else if (dl.old_line == null) added else removed;
+        const sign_color = if (dl.old_line == null) added else if (dl.new_line == null) removed else muted;
+        const sign: u8 = if (dl.old_line == null) '+' else if (dl.new_line == null) '-' else ' ';
+        const source_idx = if (dl.new_idx) |idx| idx else dl.old_idx.?;
+        const source_lines = if (dl.new_idx != null) new_lines.items else old_lines.items;
+        const display_text = source_lines[source_idx];
+        try appendStackDiffRow(allocator, &result, dl.old_line, dl.new_line, sign, display_text, line_digits, content_width, kind_bg, rail_color, number_color, sign_color, line_number_bg, text, normal_text);
     }
 
     return result.toOwnedSlice(allocator);
@@ -256,7 +282,7 @@ fn stripAnsiLen(text: []const u8) usize {
 fn truncateAnsiText(allocator: std.mem.Allocator, text: []const u8, max_len: usize) ![]u8 {
     var result = std.ArrayList(u8).empty;
     errdefer result.deinit(allocator);
-    
+
     var visible_len: usize = 0;
     var i: usize = 0;
     while (i < text.len and visible_len < max_len) {
@@ -280,8 +306,61 @@ fn truncateAnsiText(allocator: std.mem.Allocator, text: []const u8, max_len: usi
             i += 1;
         }
     }
-    
+
     return result.toOwnedSlice(allocator);
+}
+
+fn decimalDigits(value: usize) usize {
+    var digits: usize = 1;
+    var remaining = value;
+    while (remaining >= 10) : (digits += 1) remaining /= 10;
+    return digits;
+}
+
+fn appendLineNumber(allocator: std.mem.Allocator, result: *std.ArrayList(u8), line: ?usize, width: usize) !void {
+    if (line) |ln| {
+        try result.print(allocator, "{d: >[1]}", .{ ln, width });
+    } else {
+        try result.appendNTimes(allocator, ' ', width);
+    }
+}
+
+fn appendStackDiffRow(
+    allocator: std.mem.Allocator,
+    result: *std.ArrayList(u8),
+    old_line: ?usize,
+    new_line: ?usize,
+    sign: u8,
+    display_text: []const u8,
+    line_digits: usize,
+    content_width: usize,
+    row_bg: []const u8,
+    rail_color: []const u8,
+    number_color: []const u8,
+    sign_color: []const u8,
+    line_number_bg: []const u8,
+    text_color: []const u8,
+    reset: []const u8,
+) !void {
+    const was_truncated = stripAnsiLen(display_text) > content_width;
+    const row_text = if (was_truncated) blk: {
+        const truncated = try truncateAnsiText(allocator, display_text, content_width - 1);
+        break :blk truncated;
+    } else display_text;
+    defer if (was_truncated) allocator.free(row_text);
+
+    try result.print(allocator, "{s}{s}▌{s}{s}", .{ row_bg, rail_color, number_color, line_number_bg });
+    try appendLineNumber(allocator, result, old_line, line_digits);
+    try result.append(allocator, ' ');
+    try appendLineNumber(allocator, result, new_line, line_digits);
+    try result.print(allocator, " {s}{c} {s}{s}", .{ sign_color, sign, row_bg, text_color });
+    try result.appendSlice(allocator, row_text);
+    if (stripAnsiLen(row_text) < content_width) {
+        try result.appendSlice(allocator, row_bg);
+        try result.appendNTimes(allocator, ' ', content_width - stripAnsiLen(row_text));
+    }
+    try result.appendSlice(allocator, reset);
+    try result.append(allocator, '\n');
 }
 
 /// Compute longest common subsequence using dynamic programming

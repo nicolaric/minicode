@@ -10,6 +10,8 @@ const thinking_marker = utils.thinking_marker;
 const user_marker = utils.user_marker;
 const diff_box_marker = utils.diff_box_marker;
 const shell_output_marker = utils.shell_output_marker;
+const hidden_marker = utils.hidden_marker;
+const toggle_marker = utils.toggle_marker;
 
 /// Render the welcome screen
 pub fn renderWelcome(self: *App) !void {
@@ -53,7 +55,7 @@ pub fn renderWelcome(self: *App) !void {
     else
         0;
     const welcome_input_content_rows = welcomeInputRows(self, welcome_room_for_input);
-    const input_box_height = 2 + welcome_input_content_rows; // content rows + spacer row + bottom model row
+    const input_box_height = 3 + welcome_input_content_rows; // content rows + spacer row + model row + bottom row
     const title_to_input_gap: usize = 3;
     const input_section_height = title_height + title_to_input_gap + input_box_height; // title + gap + input box
     const cool_stuff_height = 0;
@@ -223,7 +225,8 @@ fn printWelcomeInputArea(self: *App, stdout: anytype, input_width: usize, left_m
         theme.mocha.surface0_bg,
     });
     const model_text = self.cfg.model;
-    const max_model_len = if (input_width > border_cols + input_left_padding + 2) input_width - border_cols - input_left_padding - 2 else 0;
+    // Available width = input_width - border(1) - space after border(1) = input_width - 2
+    const max_model_len = if (input_width > 2) input_width - 2 else 0;
     const prefix_len = 8; // "Build · " length
     const available_for_model = if (max_model_len > prefix_len) max_model_len - prefix_len else 0;
     const display_model = if (model_text.len > available_for_model) model_text[0..available_for_model] else model_text;
@@ -231,6 +234,15 @@ fn printWelcomeInputArea(self: *App, stdout: anytype, input_width: usize, left_m
     const total_content_len = prefix_len + display_model.len;
     const model_padding = if (total_content_len < max_model_len) max_model_len - total_content_len else 0;
     if (model_padding > 0) try stdout.splatByteAll(' ', model_padding);
+    try stdout.print("{s}\x1b[K{s}\n", .{ theme.mocha.mantle_bg, theme.reset });
+    // Extra bottom row with border inside input box
+    try stdout.print("{s}", .{theme.mocha.mantle_bg});
+    try stdout.splatByteAll(' ', left_margin);
+    try stdout.print("{s}▌{s}", .{
+        theme.mocha.lavender,
+        theme.mocha.surface0_bg,
+    });
+    if (border_cols < input_width) try stdout.splatByteAll(' ', input_width - border_cols);
     try stdout.print("{s}\x1b[K{s}\n", .{ theme.mocha.mantle_bg, theme.reset });
 }
 
@@ -257,7 +269,7 @@ pub fn renderWelcomeInput(self: *App) !void {
     else
         0;
     const welcome_input_content_rows = welcomeInputRows(self, welcome_room_for_input);
-    const input_box_height = 2 + welcome_input_content_rows; // content rows + spacer row + bottom model row
+    const input_box_height = 3 + welcome_input_content_rows; // content rows + spacer row + model row + bottom row
     const title_to_input_gap: usize = 3;
 
     const input_width: usize = utils.welcome_input_width;
@@ -402,16 +414,20 @@ pub fn printConversation(self: *App, stdout: anytype, inner_cols: usize, left_ma
         const is_thinking = std.mem.startsWith(u8, line, thinking_marker);
         const is_diff = !is_thinking and std.mem.startsWith(u8, line, diff_box_marker);
         const is_shell = !is_thinking and !is_diff and std.mem.startsWith(u8, line, shell_output_marker);
-        const display_line = if (is_thinking) line[thinking_marker.len..] else if (is_shell) line[shell_output_marker.len..] else line;
+        const is_hidden = !is_thinking and !is_diff and !is_shell and std.mem.startsWith(u8, line, hidden_marker);
+        const is_toggle = !is_thinking and !is_diff and !is_shell and !is_hidden and std.mem.startsWith(u8, line, toggle_marker);
+
+        if (is_hidden) continue;
+
+        const display_line = if (is_thinking) line[thinking_marker.len..] else if (is_shell) line[shell_output_marker.len..] else if (is_toggle) line[toggle_marker.len..] else line;
         const display_without_marker = if (is_diff) display_line[diff_box_marker.len..] else display_line;
 
-        // Detect user message at conversation level (like thinking)
-        const is_user_message = !is_diff and !is_thinking and !is_shell and std.mem.startsWith(u8, display_without_marker, user_marker);
+        const is_user_message = !is_diff and !is_thinking and !is_shell and !is_hidden and !is_toggle and std.mem.startsWith(u8, display_without_marker, user_marker);
         const user_content = if (is_user_message) display_without_marker[user_marker.len..] else display_without_marker;
 
         const effective_line = if (is_user_message) user_content else display_without_marker;
-        const row_cols = utils.rowContentCols(inner_cols, is_user_message, is_thinking, is_diff, is_shell);
-        const line_rows = utils.wrappedRows(effective_line.len, row_cols);
+        const row_cols = utils.rowContentCols(inner_cols, is_user_message, is_thinking, is_diff or is_toggle, is_shell);
+        const line_rows = if (is_diff or is_toggle) 1 else utils.wrappedRows(effective_line.len, row_cols);
 
         if (skipped + line_rows <= start_row) {
             skipped += line_rows;
@@ -428,6 +444,8 @@ pub fn printConversation(self: *App, stdout: anytype, inner_cols: usize, left_ma
                     try printThinkingRowWithMargin(self, stdout, "", left_margin);
                 } else if (is_shell) {
                     try printShellRowWithMargin(stdout, "", left_margin, inner_cols);
+                } else if (is_toggle) {
+                    try printDiffBoxRowWithMargin(stdout, "", left_margin, inner_cols);
                 } else {
                     try printRowWithMargin(stdout, "", left_margin);
                 }
@@ -438,9 +456,8 @@ pub fn printConversation(self: *App, stdout: anytype, inner_cols: usize, left_ma
             continue;
         }
 
-        // Diff lines contain ANSI codes and are already formatted to terminal width
-        // Print them as-is without wrapping to avoid breaking ANSI sequences
-        if (is_diff) {
+        // Diff and toggle lines contain ANSI codes, print as-is without wrapping
+        if (is_diff or is_toggle) {
             if (skipped < start_row) {
                 skipped += 1;
                 continue;
@@ -464,7 +481,6 @@ pub fn printConversation(self: *App, stdout: anytype, inner_cols: usize, left_ma
             const chunk_len = @min(row_cols, effective_line.len - offset);
             const chunk = effective_line[offset .. offset + chunk_len];
             if (is_user_message) {
-                // First row of user message gets border, continuation rows don't
                 try printUserRowWithMargin(stdout, chunk, left_margin, inner_cols, local_row == 0);
             } else if (is_thinking) {
                 try printThinkingRowWithMargin(self, stdout, chunk, left_margin);
@@ -510,12 +526,16 @@ fn countWrappedRows(self: *App, inner_cols: usize) usize {
         const is_user = !is_thinking and std.mem.startsWith(u8, line, user_marker);
         const is_diff = !is_thinking and std.mem.startsWith(u8, line, diff_box_marker);
         const is_shell = !is_thinking and !is_user and !is_diff and std.mem.startsWith(u8, line, shell_output_marker);
-        const display = if (is_thinking) line[thinking_marker.len..] else if (is_diff) line[diff_box_marker.len..] else if (is_user) line[user_marker.len..] else if (is_shell) line[shell_output_marker.len..] else line;
-        // Diff lines are not wrapped (they contain ANSI codes and are pre-formatted)
-        if (is_diff) {
+        const is_hidden = !is_thinking and !is_user and !is_diff and !is_shell and std.mem.startsWith(u8, line, hidden_marker);
+        const is_toggle = !is_thinking and !is_user and !is_diff and !is_shell and !is_hidden and std.mem.startsWith(u8, line, toggle_marker);
+
+        if (is_hidden) continue;
+
+        const display = if (is_thinking) line[thinking_marker.len..] else if (is_diff) line[diff_box_marker.len..] else if (is_user) line[user_marker.len..] else if (is_shell) line[shell_output_marker.len..] else if (is_toggle) line[toggle_marker.len..] else line;
+        if (is_diff or is_toggle) {
             total += 1;
         } else {
-            total += utils.wrappedRows(display.len, utils.rowContentCols(inner_cols, is_user, is_thinking, is_diff, is_shell));
+            total += utils.wrappedRows(display.len, utils.rowContentCols(inner_cols, is_user, is_thinking, is_diff or is_toggle, is_shell));
         }
     }
     return total;
@@ -629,9 +649,8 @@ fn printInputArea(self: *App, stdout: anytype, prompt: []const u8, inner_cols: u
         try renderInputLine(stdout, visible_input);
         // Reset background to input box color before filling remaining space
         try stdout.print("{s}", .{theme.mocha.surface0_bg});
-        const max_used_cols = inner_cols - border_cols;
-        const used_cols = @min(max_used_cols, input_prefix_cols + visible_input.len);
-        if (used_cols < max_used_cols) try stdout.splatByteAll(' ', max_used_cols - used_cols);
+        const used_cols = input_prefix_cols + visible_input.len;
+        if (used_cols < inner_cols) try stdout.splatByteAll(' ', inner_cols - used_cols);
         try stdout.print("{s}\x1b[K{s}\n", .{ theme.mocha.mantle_bg, theme.reset });
     }
 

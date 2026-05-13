@@ -2,6 +2,7 @@ const std = @import("std");
 const config = @import("config.zig");
 
 pub const Config = config.Config;
+pub const ThinkingLevel = config.ThinkingLevel;
 
 pub const Role = enum { system, user, assistant, tool };
 
@@ -180,7 +181,7 @@ fn roleName(role: Role) []const u8 {
 }
 
 /// Non-streaming chat - waits for full response
-pub fn chat(allocator: std.mem.Allocator, cfg: config.Config, messages: []const Message) !ChatResponse {
+pub fn chat(allocator: std.mem.Allocator, cfg: config.Config, messages: []const Message, thinking_level: ThinkingLevel) !ChatResponse {
     const uri_text = try std.fmt.allocPrint(allocator, "{s}/api/chat", .{cfg.base_url});
     defer allocator.free(uri_text);
 
@@ -206,7 +207,7 @@ pub fn chat(allocator: std.mem.Allocator, cfg: config.Config, messages: []const 
     }
     defer for (api_contents) |content| allocator.free(content);
 
-    try writeChatRequest(&body.writer, cfg.model, false, json_messages);
+    try writeChatRequest(&body.writer, cfg.model, false, json_messages, thinking_level, cfg.num_ctx);
 
     var client = std.http.Client{ .allocator = allocator };
     defer client.deinit();
@@ -250,8 +251,9 @@ pub fn chatStream(
     ctx: anytype,
     comptime callback: fn (@TypeOf(ctx), StreamChunk) anyerror!void,
     comptime shouldCancel: fn (@TypeOf(ctx)) anyerror!bool,
+    thinking_level: ThinkingLevel,
 ) !void {
-    return chatStreamWithCurl(allocator, cfg, messages, ctx, callback, shouldCancel, "curl");
+    return chatStreamWithCurl(allocator, cfg, messages, ctx, callback, shouldCancel, "curl", thinking_level);
 }
 
 pub fn chatStreamWithCurl(
@@ -262,6 +264,7 @@ pub fn chatStreamWithCurl(
     comptime callback: fn (@TypeOf(ctx), StreamChunk) anyerror!void,
     comptime shouldCancel: fn (@TypeOf(ctx)) anyerror!bool,
     curl_executable: []const u8,
+    thinking_level: ThinkingLevel,
 ) !void {
     // Build JSON body
     var body_writer = std.Io.Writer.Allocating.init(allocator);
@@ -284,7 +287,7 @@ pub fn chatStreamWithCurl(
     }
     defer for (api_contents) |content| allocator.free(content);
 
-    try writeChatRequest(&body_writer.writer, cfg.model, true, json_messages);
+    try writeChatRequest(&body_writer.writer, cfg.model, true, json_messages, thinking_level, cfg.num_ctx);
 
     const body_bytes = body_writer.written();
 
@@ -451,7 +454,7 @@ const JsonMessage = struct {
     tool_call_id: ?[]const u8 = null,
 };
 
-fn writeChatRequest(writer: anytype, model: []const u8, stream: bool, messages: []const JsonMessage) !void {
+fn writeChatRequest(writer: anytype, model: []const u8, stream: bool, messages: []const JsonMessage, thinking_level: ThinkingLevel, num_ctx: usize) !void {
     try writer.writeAll("{\"model\":");
     try std.json.Stringify.value(model, .{}, writer);
     try writer.writeAll(",\"stream\":");
@@ -463,8 +466,24 @@ fn writeChatRequest(writer: anytype, model: []const u8, stream: bool, messages: 
         try writeJsonMessage(writer, message);
     }
     try writer.writeAll("]");
+
+    // Add thinking configuration - Ollama uses "think" field (boolean)
+    switch (thinking_level) {
+        .off => {
+            try writer.writeAll(",\"think\":false");
+        },
+        else => {
+            try writer.writeAll(",\"think\":true");
+        }
+    }
+
     try writer.writeAll(",\"tools\":");
     try writer.writeAll(tool_schemas_json);
+
+    if (num_ctx > 0) {
+        try writer.print(",\"options\":{{\"num_ctx\":{}}}", .{num_ctx});
+    }
+
     try writer.writeAll("}");
 }
 

@@ -441,9 +441,24 @@ fn regexMatchLine(line: []const u8, pattern: []const u8, case_sensitive: bool) b
     const anchored_start = pattern.len > 0 and pattern[0] == '^';
     const pat = if (anchored_start) pattern[1..] else pattern;
 
-    // Handle alternation (|) by trying each alternative
-    var alt_iter = std.mem.splitScalar(u8, pat, '|');
-    while (alt_iter.next()) |alt| {
+    // Handle unescaped alternation (|) by trying each alternative.
+    var alt_start: usize = 0;
+    var pos: usize = 0;
+    var in_class = false;
+    while (true) {
+        const at_alt_end = pos >= pat.len or (pat[pos] == '|' and !in_class);
+        if (!at_alt_end) {
+            if (pat[pos] == '\\') {
+                pos += if (pos + 1 < pat.len) 2 else 1;
+                continue;
+            }
+            if (pat[pos] == '[') in_class = true;
+            if (pat[pos] == ']') in_class = false;
+            pos += 1;
+            continue;
+        }
+
+        const alt = pat[alt_start..pos];
         if (anchored_start) {
             if (regexMatchFrom(line, 0, alt, 0, case_sensitive)) return true;
         } else {
@@ -452,6 +467,10 @@ fn regexMatchLine(line: []const u8, pattern: []const u8, case_sensitive: bool) b
                 if (regexMatchFrom(line, start, alt, 0, case_sensitive)) return true;
             }
         }
+
+        if (pos >= pat.len) break;
+        pos += 1;
+        alt_start = pos;
     }
     return false;
 }
@@ -470,6 +489,7 @@ fn atomMatches(line: []const u8, i: usize, pattern: []const u8, p: usize, atom_e
         return true;
     }
     if (pattern[p] == '\\') {
+        if (p + 1 >= pattern.len) return false;
         atom_end.* = p + 2;
         return charsEqual(line[i], pattern[p + 1], case_sensitive);
     }
@@ -636,6 +656,30 @@ test "grep returns ansi error for malformed regex" {
 
     const result = try grepFiles(allocator, "[abc", null, null, true, null);
     try core.testing.expect(std.mem.indexOf(u8, result, "\x1b[31mError: invalid regex pattern (unclosed character class)\x1b[0m") != null);
+}
+
+test "grep treats escaped pipe as literal" {
+    const path = ".tmp-grep-escaped-pipe-test.txt";
+    std.Io.Dir.cwd().deleteFile(std.Options.debug_io, path) catch |err| switch (err) {
+        error.FileNotFound => {},
+        else => return err,
+    };
+    defer std.Io.Dir.cwd().deleteFile(std.Options.debug_io, path) catch {};
+
+    {
+        var file = try std.Io.Dir.cwd().createFile(std.Options.debug_io, path, .{});
+        defer file.close(std.Options.debug_io);
+        try std.Io.File.writeStreamingAll(file, std.Options.debug_io, "a|b\naxb\n");
+    }
+
+    var arena = std.heap.ArenaAllocator.init(core.testing.allocator);
+    defer arena.deinit();
+    const allocator = arena.allocator();
+
+    const result = try grepFiles(allocator, "a\\|b", path, null, true, null);
+    try core.testing.expect(std.mem.indexOf(u8, result, "Found 1 matches") != null);
+    try core.testing.expect(std.mem.indexOf(u8, result, "Line: 1") != null);
+    try core.testing.expect(std.mem.indexOf(u8, result, "Line: 2") == null);
 }
 
 test "grep searches current directory by default" {

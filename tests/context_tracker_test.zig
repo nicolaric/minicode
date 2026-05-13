@@ -31,7 +31,7 @@ test "ContextTracker generates narrative summary" {
     
     // Generate summary
     tracker.round_count = 4; // Force summary generation
-    const summary = try tracker.generateSummary();
+    const summary = try tracker.generateSummary() orelse return error.TestUnexpectedResult;
     defer allocator.free(summary);
     
     // Summary should contain project type and discoveries

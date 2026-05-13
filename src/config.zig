@@ -3,10 +3,47 @@ const std = @import("std");
 pub const default_base_url = "http://127.0.0.1:11434";
 pub const default_model = "qwen3.6:27b-coding-nvfp4";
 
+pub const ThinkingLevel = enum {
+    off,
+    minimal,
+    low,
+    medium,
+    high,
+    xhigh,
+
+    pub fn toTokenBudget(self: ThinkingLevel) u32 {
+        return switch (self) {
+            .off => 0,
+            .minimal => 1024,
+            .low => 4096,
+            .medium => 10240,
+            .high => 32768,
+            .xhigh => 65536,
+        };
+    }
+
+    pub fn fromStr(s: []const u8) ThinkingLevel {
+        return std.meta.stringToEnum(ThinkingLevel, s) orelse .off;
+    }
+
+    pub fn displayName(self: ThinkingLevel) []const u8 {
+        return switch (self) {
+            .off => "off",
+            .minimal => "minimal",
+            .low => "low",
+            .medium => "medium",
+            .high => "high",
+            .xhigh => "xhigh",
+        };
+    }
+};
+
 pub const Config = struct {
     base_url: []const u8,
     model: []const u8,
     model_explicit: bool = false,
+    thinking_level: ThinkingLevel = .off,
+    num_ctx: usize = 8192,
 };
 
 pub const Loaded = struct {
@@ -43,6 +80,7 @@ pub fn load(allocator: std.mem.Allocator) !Loaded {
         .base_url = default_base_url,
         .model = default_model,
         .model_explicit = false,
+        .num_ctx = 0,
     } };
     errdefer loaded.deinit(allocator);
 
@@ -64,6 +102,12 @@ pub fn load(allocator: std.mem.Allocator) !Loaded {
         }
         loaded.config.model = model;
         loaded.config.model_explicit = true;
+    }
+    if (getEnvVar("NIC_THINKING_LEVEL")) |level| {
+        loaded.config.thinking_level = ThinkingLevel.fromStr(level);
+    }
+    if (getEnvVar("OLLAMA_NUM_CTX")) |num_ctx_str| {
+        loaded.config.num_ctx = std.fmt.parseUnsigned(usize, num_ctx_str, 10) catch 0;
     }
 
     return loaded;
@@ -107,6 +151,8 @@ fn parseFileConfig(allocator: std.mem.Allocator, bytes: []const u8) !Loaded {
         .base_url = default_base_url,
         .model = default_model,
         .model_explicit = false,
+        .thinking_level = .off,
+        .num_ctx = 0,
     } };
     errdefer loaded.deinit(allocator);
 
@@ -123,6 +169,14 @@ fn parseFileConfig(allocator: std.mem.Allocator, bytes: []const u8) !Loaded {
         loaded.owned_model = try allocator.dupe(u8, value);
         loaded.config.model = loaded.owned_model.?;
         loaded.config.model_explicit = true;
+    }
+    if (jsonString(root.get("thinking_level"))) |value| {
+        loaded.config.thinking_level = ThinkingLevel.fromStr(value);
+    }
+    if (root.get("num_ctx")) |value| {
+        if (value == .integer and value.integer > 0) {
+            loaded.config.num_ctx = @intCast(@as(u64, @intCast(value.integer)));
+        }
     }
 
     return loaded;

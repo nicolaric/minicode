@@ -1,6 +1,7 @@
 const std = @import("std");
 const terminal = @import("../terminal.zig");
 const app_mod = @import("app.zig");
+const config = @import("../config.zig");
 
 const App = app_mod.App;
 
@@ -38,12 +39,12 @@ pub fn handleModelModalKey(self: *App, stdin: anytype, ch: u8) !bool {
     switch (ch) {
         3, 'q' => {
             self.closeModelModal();
-            try self.render();
+            self.render();
             return true;
         },
         '\r', '\n' => {
             self.closeModelModal();
-            try self.render();
+            self.render();
             return true;
         },
         else => {},
@@ -55,7 +56,7 @@ pub fn handleModelModalKey(self: *App, stdin: anytype, ch: u8) !bool {
         const n = stdin.readSliceShort(&seq) catch 0;
         if (n == 0) {
             self.closeModelModal();
-            try self.render();
+            self.render();
             return true;
         }
         if (seq[0] != '[') return true;
@@ -72,7 +73,7 @@ pub fn handleModelModalKey(self: *App, stdin: anytype, ch: u8) !bool {
             },
             else => {},
         }
-        try self.render();
+        self.render();
         return true;
     }
 
@@ -85,7 +86,67 @@ pub fn handleModelModalKey(self: *App, stdin: anytype, ch: u8) !bool {
         },
         else => return true,
     }
-    try self.render();
+    self.render();
+    return true;
+}
+
+/// Handle thinking modal key input
+pub fn handleThinkingModalKey(self: *App, stdin: anytype, ch: u8) !bool {
+    const thinking_levels: usize = 6; // off, minimal, low, medium, high, xhigh
+    switch (ch) {
+        3, 'q' => {
+            self.closeThinkingModal();
+            self.render();
+            return true;
+        },
+        '\r', '\n' => {
+            // Apply selected thinking level
+            const level = @as(config.ThinkingLevel, @enumFromInt(self.thinking_selected));
+            self.cfg.thinking_level = level;
+            self.closeThinkingModal();
+            self.render();
+            return true;
+        },
+        else => {},
+    }
+
+    const count = thinking_levels;
+    if (ch == 27) {
+        var seq: [1]u8 = undefined;
+        const n = stdin.readSliceShort(&seq) catch 0;
+        if (n == 0) {
+            self.closeThinkingModal();
+            self.render();
+            return true;
+        }
+        if (seq[0] != '[') return true;
+
+        var seq2: [1]u8 = undefined;
+        const n2 = stdin.readSliceShort(&seq2) catch 0;
+        if (n2 == 0) return true;
+        switch (seq2[0]) {
+            'A' => {
+                if (self.thinking_selected > 0) self.thinking_selected -= 1;
+            },
+            'B' => {
+                if (self.thinking_selected + 1 < count) self.thinking_selected += 1;
+            },
+            else => {},
+        }
+        self.render();
+        return true;
+    }
+
+    switch (ch) {
+        'k' => {
+            if (self.thinking_selected > 0) self.thinking_selected -= 1;
+        },
+        'j' => {
+            if (self.thinking_selected + 1 < count) self.thinking_selected += 1;
+        },
+        else => return true,
+    }
+    self.render();
     return true;
 }
 
@@ -298,7 +359,7 @@ pub fn handleCommandPaletteKey(self: *App, stdin: anytype, ch: u8) !bool {
         const n = stdin.readSliceShort(&seq) catch 0;
         if (n == 0) {
             self.closeCommandPalette();
-            try self.render();
+            self.render();
             return true;
         }
         if (seq[0] != '[') return true;
@@ -315,14 +376,14 @@ pub fn handleCommandPaletteKey(self: *App, stdin: anytype, ch: u8) !bool {
             },
             else => {},
         }
-        try self.render();
+        self.render();
         return true;
     }
 
     switch (ch) {
         3, 27 => {
             self.closeCommandPalette();
-            try self.render();
+            self.render();
             return true;
         },
         '\r', '\n' => {
@@ -339,10 +400,12 @@ pub fn handleCommandPaletteKey(self: *App, stdin: anytype, ch: u8) !bool {
                 return error.Exit;
             } else if (std.mem.eql(u8, command, "/model")) {
                 try self.openModelModal();
+            } else if (std.mem.eql(u8, command, "/thinking")) {
+                self.openThinkingModal();
             } else if (std.mem.eql(u8, command, "/new")) {
                 try self.resetConversation();
             }
-            try self.render();
+            self.render();
             return true;
         },
         else => {
@@ -350,6 +413,6 @@ pub fn handleCommandPaletteKey(self: *App, stdin: anytype, ch: u8) !bool {
             return false;
         },
     }
-    try self.render();
+    self.render();
     return true;
 }

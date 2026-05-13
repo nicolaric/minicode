@@ -73,10 +73,23 @@ pub fn build(b: *std.Build) void {
     shell_tests.root_module.addImport("syntax", flow_syntax_dep.module("syntax"));
 
     const run_shell_tests = b.addRunArtifact(shell_tests);
+
+    const search_tests = b.addTest(.{
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("tests/search_test.zig"),
+            .target = target,
+            .optimize = optimize,
+        }),
+    });
+    search_tests.root_module.addImport("tools", tools_module);
+    search_tests.root_module.addImport("syntax", flow_syntax_dep.module("syntax"));
+
+    const run_search_tests = b.addRunArtifact(search_tests);
     
     const test_step = b.step("test", "Run tests");
     test_step.dependOn(&run_unit_tests.step);
     test_step.dependOn(&run_shell_tests.step);
+    test_step.dependOn(&run_search_tests.step);
     
     const shell_test_step = b.step("test-shell", "Run shell execution tests only");
     shell_test_step.dependOn(&run_shell_tests.step);

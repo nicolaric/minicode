@@ -2,6 +2,7 @@ const std = @import("std");
 const theme = @import("../theme.zig");
 const app_mod = @import("app.zig");
 const utils = @import("utils.zig");
+const config = @import("../config.zig");
 
 const App = app_mod.App;
 
@@ -130,6 +131,46 @@ pub fn printModelModal(self: *App, stdout: anytype, rows: usize, cols: usize) !v
         try printModalText(stdout, content_top + 2, left, width, "Loading...", theme.mocha.subtext0, false);
         var row: usize = 1;
         while (row < list_rows) : (row += 1) {
+            try printModalText(stdout, content_top + 2 + row, left, width, "", theme.mocha.text, false);
+        }
+    }
+
+    try printModalText(stdout, help_row, left, width, "arrows/j/k move, Enter/Esc/q closes", theme.mocha.surface0, false);
+}
+
+/// Print the thinking level selection modal
+pub fn printThinkingModal(self: *App, stdout: anytype, rows: usize, cols: usize) !void {
+    if (rows < 10 or cols < 28) return;
+
+    const width: usize = @min(if (cols > 40) 32 else cols - 4, cols - 2);
+    const height: usize = @min(if (rows > 18) 14 else rows - 4, rows - 2);
+    const left = (cols - width) / 2 + 1;
+    const top = (rows - height) / 2 + 1;
+    const inner_width = width;
+    const text_width = inner_width - 4;
+    const content_top = top + utils.model_modal_vertical_padding;
+    const help_row = top + height - utils.model_modal_vertical_padding - 1;
+    const list_rows = if (height > utils.model_modal_vertical_padding * 2 + 3) height - utils.model_modal_vertical_padding * 2 - 3 else 1;
+
+    try printModalBackdrop(stdout, rows, cols);
+    try printModalPanel(stdout, top, left, width, height);
+    try printModalText(stdout, content_top, left, width, "Thinking Level", theme.mocha.mauve, false);
+    try printModalText(stdout, content_top + 1, left, width, "", theme.mocha.text, false);
+
+    const level_names = [_][]const u8{ "off", "minimal", "low", "medium", "high", "xhigh" };
+    const current = @intFromEnum(self.cfg.thinking_level);
+
+    var row: usize = 0;
+    while (row < list_rows) : (row += 1) {
+        const index = row;
+        if (index < level_names.len) {
+            const selected = index == self.thinking_selected;
+            const active = index == current;
+            const level_color = if (selected) theme.mocha.surface0 else if (active) theme.mocha.green else theme.mocha.subtext0;
+            var display_buf: [32]u8 = undefined;
+            const display = std.fmt.bufPrint(&display_buf, "{s}", .{level_names[index]}) catch level_names[index];
+            try printModalText(stdout, content_top + 2 + row, left, width, display[0..@min(display.len, text_width)], level_color, selected);
+        } else {
             try printModalText(stdout, content_top + 2 + row, left, width, "", theme.mocha.text, false);
         }
     }
