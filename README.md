@@ -37,10 +37,11 @@ In another terminal, pull the default coding model:
 ollama pull qwen3.6:27b-coding-nvfp4
 ```
 
-By default, `minicode` uses:
+By default, `minicode` connects to:
 
 - `OLLAMA_BASE_URL=http://127.0.0.1:11434`
-- `OLLAMA_MODEL=qwen3.6:27b-coding-nvfp4`
+
+If no model is configured explicitly, `minicode` asks Ollama for locally available models and uses the first one returned. The built-in fallback model is `qwen3.6:27b-coding-nvfp4`.
 
 Override them when needed:
 
@@ -53,13 +54,27 @@ You can also set defaults in `~/.config/minicode/config.json`:
 ```json
 {
   "model": "qwen3.6:27b-coding-nvfp4",
-  "base_url": "http://127.0.0.1:11434"
+  "base_url": "http://127.0.0.1:11434",
+  "thinking_level": "off",
+  "num_ctx": 8192
 }
 ```
 
-Environment variables take precedence over the config file.
+Supported config keys:
 
-Syntax highlighting is enabled by default. Set `NIC_SYNTAX_HIGHLIGHTING` to a truthy value (`true`, `1`, or `yes`) to enable it explicitly; any other value disables it.
+- `base_url` or `ollama_base_url`: Ollama endpoint.
+- `model`, `default_model`, or `ollama_model`: model name to use.
+- `thinking_level`: one of `off`, `minimal`, `low`, `medium`, `high`, or `xhigh`. Any unknown value falls back to `off`.
+- `num_ctx`: optional Ollama context window size.
+
+Environment variables take precedence over the config file:
+
+- `OLLAMA_BASE_URL`: Ollama endpoint.
+- `OLLAMA_MODEL`: model name to use.
+- `NIC_THINKING_LEVEL`: thinking level (`off`, `minimal`, `low`, `medium`, `high`, or `xhigh`).
+- `OLLAMA_NUM_CTX`: optional Ollama context window size.
+
+Syntax highlighting is enabled by default for rendered code blocks and diffs.
 
 ## Build and run
 
@@ -87,12 +102,20 @@ After building, the installed executable is available at:
 
 - `Enter`: send the current message
 - `/exit` or `/quit`: exit
+- `/model`: open a local Ollama model picker
+- `/thinking`: open the thinking-level picker
+- `/new`: clear the current conversation and start over
+- `/`: open the command palette when the input is empty
 - `Ctrl+C`: exit while idle; cancel the current stream/tool turn while busy
 - `Esc`: cancel while busy
 - `Up` / `Down`: scroll the transcript
 - `PageUp` / `PageDown`: scroll by a page
+- `Ctrl+U` / `Ctrl+D`: scroll by a half page
+- `Ctrl+E`: expand or collapse long shell output blocks
 - `Left` / `Right`: move the input cursor
+- `Option+Left` / `Option+Right`: move the input cursor by word in many terminals
 - `Backspace`: delete the character before the cursor
+- `Delete`: delete the character under the cursor
 
 While the agent is busy streaming, new messages are not submitted. Draft input is kept and can be sent after the busy turn finishes or is cancelled.
 
